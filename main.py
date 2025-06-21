@@ -39,17 +39,19 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 active_quizzes = {}
 
 
+# --- Główny Event On Ready ---
 @bot.event
-async def on_ready_final():
+async def on_ready(): # Zmieniono nazwę z on_ready_final/on_ready_setup na standardowe on_ready
     print(f'Zalogowano jako {bot.user}')
     try:
         database.init_db()
         print("Baza danych zainicjalizowana.")
-        synced = await bot.tree.sync()
+        synced = await bot.tree.sync() # Synchronizuj globalnie
         print(f"Zsynchronizowano {len(synced)} komend(y) globalnie.")
     except Exception as e:
-        print(f"Wystąpił błąd podczas synchronizacji komend lub inicjalizacji DB: {e}")
+        print(f"Wystąpił błąd podczas inicjalizacji lub synchronizacji komend: {e}")
 
+    # Startuj wszystkie taski w tle, jeśli jeszcze nie działają
     if hasattr(bot, 'check_expired_roles') and not check_expired_roles.is_running():
         check_expired_roles.start()
         print("Uruchomiono zadanie 'check_expired_roles'.")
@@ -58,7 +60,366 @@ async def on_ready_final():
         check_expired_punishments_task.start()
         print("Uruchomiono zadanie 'check_expired_punishments_task'.")
 
-bot.event(on_ready_final)
+    if hasattr(bot, 'check_expired_polls_task') and not check_expired_polls_task.is_running():
+        check_expired_polls_task.start()
+        print("Uruchomiono zadanie 'check_expired_polls_task'.")
+
+    if hasattr(bot, 'check_ended_giveaways_task') and not check_ended_giveaways_task.is_running(): # Nowy task dla konkursów
+        check_ended_giveaways_task.start()
+        print("Uruchomiono zadanie 'check_ended_giveaways_task'.")
+
+
+# --- Moduł Konkursów (Giveaways) ---
+GIVEAWAY_REACTION_EMOJI = "🎉"
+
+@bot.tree.command(name="create_giveaway", description="Tworzy nowy konkurs (giveaway).")
+@app_commands.describe(
+    nagroda="Co jest do wygrania?",
+    liczba_zwyciezcow="Ilu będzie zwycięzców (domyślnie 1).",
+    czas_trwania="Jak długo trwa konkurs (np. 1d, 12h, 30m).",
+    kanal="Na którym kanale opublikować konkurs (domyślnie aktualny).",
+    wymagana_rola="Rola wymagana do udziału (opcjonalnie).",
+    minimalny_poziom="Minimalny poziom aktywności wymagany do udziału (opcjonalnie)."
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def create_giveaway_command(
+    interaction: discord.Interaction,
+    nagroda: str,
+    czas_trwania: str,
+    liczba_zwyciezcow: int = 1,
+    kanal: discord.TextChannel = None,
+    wymagana_rola: discord.Role = None,
+    minimalny_poziom: int = None
+):
+    if not interaction.guild_id or not interaction.guild:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    target_channel = kanal if kanal else interaction.channel
+    if not isinstance(target_channel, discord.TextChannel):
+        await interaction.response.send_message("Konkurs może być opublikowany tylko na kanale tekstowym.", ephemeral=True)
+        return
+
+    if liczba_zwyciezcow < 1:
+        await interaction.response.send_message("Liczba zwycięzców musi wynosić co najmniej 1.", ephemeral=True)
+        return
+
+    duration_seconds = time_parser.parse_duration(czas_trwania)
+    if duration_seconds is None or duration_seconds <= 0:
+        await interaction.response.send_message("Nieprawidłowy format czasu trwania lub czas jest zbyt krótki. Użyj np. 30m, 2h, 1d.", ephemeral=True)
+        return
+
+    ends_at_timestamp = int(time.time() + duration_seconds)
+
+    try:
+        giveaway_id = database.create_giveaway(
+            guild_id=interaction.guild_id,
+            channel_id=target_channel.id,
+            prize=nagroda,
+            winner_count=liczba_zwyciezcow,
+            created_by_id=interaction.user.id,
+            ends_at=ends_at_timestamp,
+            required_role_id=wymagana_rola.id if wymagana_rola else None,
+            min_level=minimalny_poziom
+        )
+        if giveaway_id is None:
+            await interaction.response.send_message("Nie udało się utworzyć konkursu w bazie danych.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title=f"🎉 KONKURS: {nagroda} 🎉",
+            description=f"Zareaguj {GIVEAWAY_REACTION_EMOJI} aby wziąć udział!",
+            color=discord.Color.gold(),
+            timestamp=datetime.utcfromtimestamp(ends_at_timestamp)
+        )
+        embed.add_field(name="Nagroda", value=nagroda, inline=False)
+        embed.add_field(name="Liczba zwycięzców", value=str(liczba_zwyciezcow), inline=True)
+        embed.add_field(name="Koniec", value=f"<t:{ends_at_timestamp}:R> (<t:{ends_at_timestamp}:F>)", inline=True)
+
+        conditions = []
+        if wymagana_rola:
+            conditions.append(f"- Musisz posiadać rolę: {wymagana_rola.mention}")
+        if minimalny_poziom is not None and minimalny_poziom > 0:
+            conditions.append(f"- Musisz posiadać co najmniej: Poziom {minimalny_poziom}")
+
+        if conditions:
+            embed.add_field(name="Warunki udziału", value="\n".join(conditions), inline=False)
+
+        embed.set_footer(text=f"Konkurs stworzony przez {interaction.user.display_name} | ID Konkursu: {giveaway_id}")
+
+        giveaway_message = await target_channel.send(embed=embed)
+        database.set_giveaway_message_id(giveaway_id, giveaway_message.id)
+        await giveaway_message.add_reaction(GIVEAWAY_REACTION_EMOJI)
+
+        await interaction.response.send_message(f"Konkurs na \"{nagroda}\" został pomyślnie utworzony na kanale {target_channel.mention}!", ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.response.send_message(f"Nie mam uprawnień do wysłania wiadomości lub dodania reakcji na kanale {target_channel.mention}.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Wystąpił nieoczekiwany błąd podczas tworzenia konkursu: {e}", ephemeral=True)
+        print(f"Błąd w /create_giveaway: {e}")
+
+@create_giveaway_command.error
+async def create_giveaway_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień do zarządzania serwerem, aby utworzyć konkurs.", ephemeral=True)
+    else:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)
+        else:
+            await interaction.followup.send(f"Wystąpił błąd: {error}", ephemeral=True)
+        print(f"Błąd w create_giveaway_error: {error}")
+
+# --- Wspólna logika kończenia konkursu ---
+async def _handle_giveaway_end_logic(guild: discord.Guild,
+                                   giveaway_data: dict,
+                                   giveaway_message: discord.Message,
+                                   is_manual_end: bool = False,
+                                   reroll_target_user: discord.Member | None = None,
+                                   num_to_reroll: int = 1):
+    channel = guild.get_channel(giveaway_data["channel_id"])
+    if not channel or not isinstance(channel, discord.TextChannel):
+        print(f"[GIVEAWAY_LOGIC] Błąd: Kanał {giveaway_data['channel_id']} nie istnieje lub nie jest tekstowy.")
+        database.end_giveaway(giveaway_data["id"], [])
+        return None, "Nie znaleziono kanału konkursu."
+
+    reaction_to_check = discord.utils.get(giveaway_message.reactions, emoji=GIVEAWAY_REACTION_EMOJI)
+
+    participants_users = []
+    if reaction_to_check:
+        async for user_obj in reaction_to_check.users():
+            if not user_obj.bot:
+                member = guild.get_member(user_obj.id)
+                if member: participants_users.append(member)
+
+    eligible_participants = []
+    if participants_users:
+        required_role_id = giveaway_data.get("required_role_id")
+        min_level = giveaway_data.get("min_level")
+        for member in participants_users:
+            eligible = True
+            if required_role_id:
+                role = guild.get_role(required_role_id)
+                if not role or role not in member.roles: eligible = False
+            if eligible and min_level is not None and min_level > 0:
+                user_stats = database.get_user_stats(guild.id, member.id)
+                if user_stats['level'] < min_level: eligible = False
+            if eligible: eligible_participants.append(member)
+
+    winners = []
+    winner_ids = []
+    action_type_log_suffix = ""
+
+    current_winners_ids = giveaway_data.get("winners_json") or []
+
+    if reroll_target_user:
+        if reroll_target_user.id not in current_winners_ids:
+            return None, f"{reroll_target_user.mention} nie był/a jednym z pierwotnych zwycięzców."
+
+        eligible_for_reroll = [p for p in eligible_participants if p.id != reroll_target_user.id and p.id not in current_winners_ids]
+        if not eligible_for_reroll:
+            return None, "Brak kwalifikujących się uczestników do ponownego losowania (poza obecnymi zwycięzcami i celem rerolla)."
+
+        new_winner = random.choice(eligible_for_reroll)
+        winners = [new_winner]
+        winner_ids = [new_winner.id]
+
+        updated_winner_ids = [w_id if w_id != reroll_target_user.id else new_winner.id for w_id in current_winners_ids]
+        database.end_giveaway(giveaway_data["id"], updated_winner_ids) # Nadpisz listę zwycięzców
+        action_type_log_suffix = f" (Reroll: {reroll_target_user.name} -> {new_winner.name})"
+        results_title = f"🔄 REROLL Konkursu: {giveaway_data['prize']} 🔄"
+        results_message_content = f"Nowy zwycięzca w konkursie na **{giveaway_data['prize']}** (zastępując {reroll_target_user.mention}) to {new_winner.mention}!"
+    else: # Normalne zakończenie lub ogólny reroll (jeśli nie podano kogo zastąpić)
+        winner_count_to_draw = giveaway_data["winner_count"] if not reroll_target_user else num_to_reroll
+
+        # Dla ogólnego reroll, losujemy spośród tych, co nie wygrali
+        eligible_for_this_draw = [p for p in eligible_participants if p.id not in current_winners_ids] if current_winners_ids and not reroll_target_user else eligible_participants
+
+        if eligible_for_this_draw:
+            if len(eligible_for_this_draw) <= winner_count_to_draw:
+                winners = eligible_for_this_draw
+            else:
+                winners = random.sample(eligible_for_this_draw, winner_count_to_draw)
+            winner_ids = [w.id for w in winners]
+
+        if not reroll_target_user: # Tylko przy pierwszym losowaniu lub pełnym rerollu nadpisujemy wszystkich
+             database.end_giveaway(giveaway_data["id"], winner_ids)
+
+        action_type_log_suffix = " (Manual Reroll)" if current_winners_ids and not reroll_target_user else ""
+        results_title = f"🎉 Konkurs Zakończony{action_type_log_suffix}: {giveaway_data['prize']} 🎉"
+        if winners:
+            winner_mentions = [w.mention for w in winners]
+            results_message_content = f"Gratulacje dla {', '.join(winner_mentions)}! Wygraliście **{giveaway_data['prize']}**!"
+        elif not eligible_participants and participants_users:
+            results_message_content = f"Niestety, nikt nie spełnił warunków konkursu na **{giveaway_data['prize']}**."
+        else:
+            results_message_content = f"Niestety, nikt nie wygrał w konkursie na **{giveaway_data['prize']}**."
+
+    print(f"[GIVEAWAY_LOGIC] Konkurs ID {giveaway_data['id']}{action_type_log_suffix}. Zwycięzcy: {winner_ids}")
+
+    results_embed = discord.Embed(title=results_title, color=discord.Color.dark_green() if winners else discord.Color.dark_red(), timestamp=datetime.utcnow())
+    results_embed.add_field(name="Nagroda", value=giveaway_data['prize'], inline=False)
+    if winners:
+        results_embed.add_field(name=f"🏆 Zwycięzcy ({len(winners)}):", value=", ".join(w.mention for w in winners), inline=False)
+    elif not eligible_participants and participants_users:
+        results_embed.add_field(name="Wynik", value="Nikt z uczestników nie spełnił warunków.", inline=False)
+    else:
+        results_embed.add_field(name="Wynik", value="Brak kwalifikujących się uczestników.", inline=False)
+
+    creator_id = giveaway_data['created_by_id']
+    creator = guild.get_member(creator_id) or await bot.fetch_user(creator_id)
+    if creator:
+        results_embed.set_footer(text=f"Konkurs ID: {giveaway_data['id']} | Stworzony przez: {creator.display_name}")
+
+    results_msg_obj = None
+    try:
+        results_msg_obj = await channel.send(content=results_message_content, embed=results_embed)
+        if not reroll_target_user: # Tylko przy pierwszym zakończeniu edytuj oryginalną wiadomość
+            try:
+                original_embed = giveaway_message.embeds[0] if giveaway_message.embeds else None
+                if original_embed:
+                    new_embed_data = original_embed.to_dict()
+                    new_embed_data['title'] = f"[ZAKOŃCZONY] {original_embed.title}"
+                    new_embed_data['color'] = discord.Color.dark_grey().value
+                    if 'fields' in new_embed_data:
+                        new_embed_data['fields'] = [f for f in new_embed_data['fields'] if f['name'] not in ["Koniec", "Warunki udziału"]]
+                    new_embed_data.setdefault('fields', []).append({'name': "Zwycięzcy", 'value': f"[Zobacz ogłoszenie]({results_msg_obj.jump_url})", 'inline': False})
+                    final_original_embed = discord.Embed.from_dict(new_embed_data)
+                    await giveaway_message.edit(embed=final_original_embed, view=None)
+            except Exception as e_edit:
+                print(f"[GIVEAWAY_LOGIC] Nie udało się edytować wiadomości konkursu {giveaway_data['message_id']}: {e_edit}")
+    except Exception as e_send_results:
+        print(f"[GIVEAWAY_LOGIC] Błąd wysyłania wyników konkursu {giveaway_data['id']}: {e_send_results}")
+        return None, "Błąd podczas ogłaszania wyników."
+
+    for winner_member in winners:
+        try:
+            await winner_member.send(f"🎉 Gratulacje! Wygrałeś/aś **{giveaway_data['prize']}** w konkursie na serwerze **{guild.name}**! Skontaktuj się z administracją.")
+        except: pass # Ignoruj błędy DM
+
+    return results_msg_obj, None
+
+
+@tasks.loop(minutes=1)
+async def check_ended_giveaways_task():
+    await bot.wait_until_ready()
+    current_timestamp = int(time.time())
+    giveaways_to_end = database.get_active_giveaways_to_end(current_timestamp)
+
+    if giveaways_to_end:
+        print(f"[GIVEAWAY_TASK] Znaleziono {len(giveaways_to_end)} konkursów do zakończenia.")
+
+    for giveaway_data in giveaways_to_end:
+        guild = bot.get_guild(giveaway_data["guild_id"])
+        if not guild:
+            print(f"[GIVEAWAY_TASK] Nie znaleziono serwera {giveaway_data['guild_id']} dla konkursu ID {giveaway_data['id']}. Kończę w bazie.")
+            database.end_giveaway(giveaway_data["id"], [])
+            continue
+
+        channel = guild.get_channel(giveaway_data["channel_id"])
+        if not channel or not isinstance(channel, discord.TextChannel): # Upewnij się, że kanał jest tekstowy
+            print(f"[GIVEAWAY_TASK] Nie znaleziono kanału {giveaway_data['channel_id']} dla konkursu ID {giveaway_data['id']}. Kończę w bazie.")
+            database.end_giveaway(giveaway_data["id"], [])
+            continue
+
+        giveaway_message = None
+        try:
+            giveaway_message = await channel.fetch_message(giveaway_data["message_id"])
+        except Exception as e: # NotFound lub inny błąd
+            print(f"[GIVEAWAY_TASK] Błąd pobierania wiadomości dla konkursu {giveaway_data['id']}: {e}. Kończę w bazie.")
+            database.end_giveaway(giveaway_data["id"], [])
+            continue
+
+        await _handle_giveaway_end_logic(guild, giveaway_data, giveaway_message)
+
+
+@bot.tree.command(name="end_giveaway", description="Manualnie kończy konkurs i losuje zwycięzców.")
+@app_commands.describe(id_wiadomosci_konkursu="ID wiadomości konkursu do zakończenia.")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def end_giveaway_command(interaction: discord.Interaction, id_wiadomosci_konkursu: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        message_id = int(id_wiadomosci_konkursu)
+    except ValueError:
+        await interaction.followup.send("ID wiadomości musi być liczbą.", ephemeral=True)
+        return
+
+    giveaway_data = database.get_giveaway_details(message_id)
+    if not giveaway_data:
+        await interaction.followup.send(f"Nie znaleziono konkursu dla wiadomości o ID: {message_id}.", ephemeral=True)
+        return
+    if not giveaway_data["is_active"]:
+        await interaction.followup.send(f"Ten konkurs (ID: {giveaway_data['id']}) jest już zakończony.", ephemeral=True)
+        return
+
+    giveaway_message = None
+    try:
+        channel = interaction.guild.get_channel(giveaway_data["channel_id"])
+        if channel and isinstance(channel, discord.TextChannel): # Upewnij się, że kanał jest tekstowy
+             giveaway_message = await channel.fetch_message(giveaway_data["message_id"])
+    except Exception as e:
+        print(f"Błąd pobierania wiadomości dla /end_giveaway {message_id}: {e}")
+
+    if not giveaway_message:
+        database.end_giveaway(giveaway_data["id"], [])
+        await interaction.followup.send("Nie znaleziono oryginalnej wiadomości konkursu. Konkurs został zakończony w bazie bez losowania.", ephemeral=True)
+        return
+
+    _, error_message = await _handle_giveaway_end_logic(interaction.guild, giveaway_data, giveaway_message, is_manual_end=True)
+    if error_message:
+        await interaction.followup.send(error_message, ephemeral=True)
+    else:
+        await interaction.followup.send(f"Konkurs \"{giveaway_data['prize']}\" (ID: {giveaway_data['id']}) został manualnie zakończony i wyniki ogłoszone.", ephemeral=True)
+
+
+@bot.tree.command(name="reroll_giveaway", description="Ponownie losuje zwycięzcę/ów dla zakończonego konkursu.")
+@app_commands.describe(id_wiadomosci_konkursu="ID wiadomości zakończonego konkursu.",
+                       uzytkownik_do_zastapienia="(Opcjonalnie) Zwycięzca, który ma zostać zastąpiony nowym losowaniem.",
+                       liczba_nowych_zwyciezcow="(Opcjonalnie, jeśli nie zastępujesz) Ilu nowych zwycięzców wylosować dodatkowo lub zamiast wszystkich.")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def reroll_giveaway_command(interaction: discord.Interaction, id_wiadomosci_konkursu: str,
+                                  uzytkownik_do_zastapienia: discord.Member = None,
+                                  liczba_nowych_zwyciezcow: int = None):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        message_id = int(id_wiadomosci_konkursu)
+    except ValueError:
+        await interaction.followup.send("ID wiadomości musi być liczbą.", ephemeral=True)
+        return
+
+    giveaway_data = database.get_giveaway_details(message_id)
+    if not giveaway_data:
+        await interaction.followup.send(f"Nie znaleziono konkursu dla wiadomości o ID: {message_id}.", ephemeral=True)
+        return
+    if giveaway_data["is_active"]:
+        await interaction.followup.send(f"Konkurs (ID: {giveaway_data['id']}) musi być najpierw zakończony.", ephemeral=True)
+        return
+
+    giveaway_message = None
+    try:
+        channel = interaction.guild.get_channel(giveaway_data["channel_id"])
+        if channel and isinstance(channel, discord.TextChannel): # Upewnij się, że kanał jest tekstowy
+            giveaway_message = await channel.fetch_message(giveaway_data["message_id"])
+    except Exception as e:
+        print(f"Błąd pobierania wiadomości dla /reroll_giveaway {message_id}: {e}")
+
+    if not giveaway_message:
+        await interaction.followup.send("Nie znaleziono oryginalnej wiadomości konkursu. Reroll niemożliwy.", ephemeral=True)
+        return
+
+    num_to_reroll_val = liczba_nowych_zwyciezcow if liczba_nowych_zwyciezcow is not None else (1 if uzytkownik_do_zastapienia else giveaway_data["winner_count"])
+    if num_to_reroll_val < 1 : num_to_reroll_val = 1
+
+
+    _, error_message = await _handle_giveaway_end_logic(
+        interaction.guild, giveaway_data, giveaway_message,
+        reroll_target_user=uzytkownik_do_zastapienia,
+        num_to_reroll=num_to_reroll_val
+    )
+    if error_message:
+        await interaction.followup.send(error_message, ephemeral=True)
+    else:
+        await interaction.followup.send(f"Przeprowadzono ponowne losowanie dla konkursu \"{giveaway_data['prize']}\" (ID: {giveaway_data['id']}).", ephemeral=True)
 
 
 # --- Moduł Ankiet ---
@@ -72,9 +433,9 @@ REGIONAL_INDICATOR_EMOJIS = [
     pytanie="Pytanie ankiety.",
     opcje="Opcje odpowiedzi, rozdzielone znakiem '|' (np. Opcja A|Opcja B|Opcja C). Maksymalnie 20 opcji.",
     czas_trwania="Czas trwania ankiety (np. 30m, 2h, 1d). Domyślnie 24h. Wpisz '0s' dla ankiety bez limitu czasu.",
-    kanal="Kanał, na którym opublikować ankietę (domyślnie aktualny kanał)."
+    kanal="Na którym kanale opublikować ankietę (domyślnie aktualny kanał)."
 )
-@app_commands.checks.has_permissions(manage_guild=True) # Lub inne odpowiednie uprawnienie
+@app_commands.checks.has_permissions(manage_guild=True)
 async def create_poll_command(interaction: discord.Interaction,
                               pytanie: str,
                               opcje: str,
@@ -85,7 +446,7 @@ async def create_poll_command(interaction: discord.Interaction,
         return
 
     target_channel = kanal if kanal else interaction.channel
-    if not isinstance(target_channel, discord.TextChannel): # Upewnienie się, że kanał jest tekstowy
+    if not isinstance(target_channel, discord.TextChannel):
         await interaction.response.send_message("Ankieta może być opublikowana tylko na kanale tekstowym.", ephemeral=True)
         return
 
@@ -100,13 +461,12 @@ async def create_poll_command(interaction: discord.Interaction,
     ends_at_timestamp = None
     if czas_trwania and czas_trwania.lower() not in ['0', '0s', 'none', 'permanent']:
         duration_seconds = time_parser.parse_duration(czas_trwania)
-        if duration_seconds is None or duration_seconds < 0: # Pozwól na 0, ale nie na ujemne
+        if duration_seconds is None or duration_seconds < 0:
             await interaction.response.send_message("Nieprawidłowy format czasu trwania. Użyj np. 30m, 2h, 1d lub '0s' dla braku limitu.", ephemeral=True)
             return
         if duration_seconds > 0 :
              ends_at_timestamp = int(time.time() + duration_seconds)
 
-    # Tworzenie ankiety w bazie
     try:
         poll_id = database.create_poll(
             guild_id=interaction.guild_id,
@@ -115,7 +475,7 @@ async def create_poll_command(interaction: discord.Interaction,
             created_by_id=interaction.user.id,
             ends_at=ends_at_timestamp
         )
-        if poll_id is None: # Powinno rzucić wyjątek, ale dla pewności
+        if poll_id is None:
             await interaction.response.send_message("Nie udało się utworzyć ankiety w bazie danych.", ephemeral=True)
             return
 
@@ -125,7 +485,6 @@ async def create_poll_command(interaction: discord.Interaction,
             database.add_poll_option(poll_id, option_text, emoji)
             poll_options_with_emoji.append(f"{emoji} {option_text}")
 
-        # Tworzenie embedu ankiety
         embed = discord.Embed(
             title=f"📊 Ankieta: {pytanie}",
             description="\n\n".join(poll_options_with_emoji),
@@ -138,11 +497,9 @@ async def create_poll_command(interaction: discord.Interaction,
         else:
             embed.add_field(name="Koniec głosowania", value="Nigdy (ręczne zamknięcie)")
 
-        # Wysyłanie wiadomości ankiety
         poll_message = await target_channel.send(embed=embed)
         database.set_poll_message_id(poll_id, poll_message.id)
 
-        # Dodawanie reakcji
         for i in range(len(parsed_options)):
             await poll_message.add_reaction(REGIONAL_INDICATOR_EMOJIS[i])
 
@@ -213,21 +570,14 @@ async def check_expired_polls_task():
         total_votes = 0
         for reaction in poll_message.reactions:
             emoji_str = str(reaction.emoji)
-            # Sprawdź, czy emoji reakcji jest jednym z emoji opcji ankiety
-            # Odejmujemy 1 od reaction.count, ponieważ liczy też reakcję bota
             is_option_emoji = any(opt['reaction_emoji'] == emoji_str for opt in poll_options)
             if is_option_emoji:
-                # Jeśli chcemy unikalne głosy (jeden użytkownik, jeden głos na opcję), musielibyśmy iterować po użytkownikach reakcji.
-                # Na razie proste zliczanie reakcji (minus bot).
-                # count = reaction.count - 1 if reaction.me else reaction.count # Jeśli bot dodaje reakcje
-                # Bezpieczniej:
                 users = [user async for user in reaction.users() if not user.bot]
                 count = len(users)
 
                 results[emoji_str] = count
                 total_votes += count
 
-        # Przygotowanie embedu z wynikami
         results_embed = discord.Embed(
             title=f"📊 Wyniki Ankiety: {poll_data['question']}",
             color=discord.Color.green(),
@@ -242,7 +592,6 @@ async def check_expired_polls_task():
             votes = results.get(emoji, 0)
             percentage = (votes / total_votes * 100) if total_votes > 0 else 0
 
-            # Prosty tekstowy pasek "wykresu"
             bar_length = 10
             filled_blocks = int(bar_length * (percentage / 100))
             bar = '█' * filled_blocks + '░' * (bar_length - filled_blocks)
@@ -264,20 +613,19 @@ async def check_expired_polls_task():
         results_message = None
         try:
             results_message = await channel.send(embed=results_embed)
-            # (Opcjonalnie) Edytuj oryginalną wiadomość ankiety
             try:
                 original_embed = poll_message.embeds[0] if poll_message.embeds else None
                 if original_embed:
                     new_embed_data = original_embed.to_dict()
                     new_embed_data['title'] = "[ZAKOŃCZONA] " + new_embed_data.get('title', poll_data['question'])
                     new_embed_data['color'] = discord.Color.dark_grey().value
-                    if 'fields' in new_embed_data: # Usuń pole o czasie zakończenia, jeśli było
+                    if 'fields' in new_embed_data:
                         new_embed_data['fields'] = [f for f in new_embed_data['fields'] if f['name'] != "Koniec głosowania"]
                     new_embed_data.setdefault('fields', []).append({'name': "Wyniki", 'value': f"[Zobacz wyniki]({results_message.jump_url})", 'inline': False})
 
                     final_embed = discord.Embed.from_dict(new_embed_data)
-                    await poll_message.edit(embed=final_embed, view=None) # Usuń reakcje/przyciski jeśli były
-                    await poll_message.clear_reactions() # Usuń wszystkie reakcje z wiadomości ankiety
+                    await poll_message.edit(embed=final_embed, view=None)
+                    await poll_message.clear_reactions()
             except Exception as e_edit:
                 print(f"[POLL_TASK] Nie udało się edytować oryginalnej wiadomości ankiety ID {poll_data['message_id']}: {e_edit}")
 
@@ -290,67 +638,9 @@ async def check_expired_polls_task():
         print(f"[POLL_TASK] Ankieta ID {poll_data['id']} została zamknięta i wyniki ogłoszone.")
 
 
-# Modyfikacja on_ready_final aby startować nowy task
-_on_ready_final_original = on_ready_final # Zakładamy, że on_ready_final jest już zdefiniowane
-
-async def on_ready_with_all_tasks_including_polls():
-    await _on_ready_final_original()
-    if not check_expired_polls_task.is_running():
-        check_expired_polls_task.start()
-        print("Uruchomiono zadanie 'check_expired_polls_task'.")
-
-# Nadpisujemy @bot.event on_ready_final nową funkcją
-# To jest trochę nieeleganckie, lepiej mieć jedną funkcję on_ready.
-# Zrefaktoryzuję to w następnym kroku, aby on_ready_final było jedną funkcją.
-# Na razie, dla tego kroku, zrobię to tak:
-# bot.event(on_ready_with_all_tasks_including_polls) # Re-rejestrujemy on_ready
-# Powyższe było niepoprawne, @bot.event dekoruje funkcję, a nie ją zastępuje w ten sposób.
-# Prawidłowa refaktoryzacja on_ready jest poniżej.
-
-# --- Główny Event On Ready ---
-@bot.event
-async def on_ready_setup(): # Nowa, jednolita funkcja on_ready
-    print(f'Zalogowano jako {bot.user}')
-    try:
-        database.init_db()
-        print("Baza danych zainicjalizowana.")
-        synced = await bot.tree.sync() # Synchronizuj globalnie
-        print(f"Zsynchronizowano {len(synced)} komend(y) globalnie.")
-    except Exception as e:
-        print(f"Wystąpił błąd podczas inicjalizacji lub synchronizacji komend: {e}")
-
-    # Startuj wszystkie taski w tle, jeśli jeszcze nie działają
-    if hasattr(bot, 'check_expired_roles') and not check_expired_roles.is_running():
-        check_expired_roles.start()
-        print("Uruchomiono zadanie 'check_expired_roles'.")
-
-    if hasattr(bot, 'check_expired_punishments_task') and not check_expired_punishments_task.is_running():
-        check_expired_punishments_task.start()
-        print("Uruchomiono zadanie 'check_expired_punishments_task'.")
-
-    if hasattr(bot, 'check_expired_polls_task') and not check_expired_polls_task.is_running(): # Nowy task dla ankiet
-        check_expired_polls_task.start()
-        print("Uruchomiono zadanie 'check_expired_polls_task'.")
-
-# Usunięcie starych, potencjalnie konfliktujących dekoratorów @bot.event dla on_ready
-# i przypisanie nowej funkcji. Jeśli `on_ready_final` lub `on_ready_with_tasks`
-# były wcześniej dekorowane, to ten krok jest ważny.
-# Jeśli `on_ready_final` było już jedynym handlerem, to to jest OK.
-# Dla pewności, usuwam wszystkie poprzednie listenery 'on_ready' i dodaję nowy.
-# To jest bardziej zaawansowane i może nie być konieczne, jeśli struktura była prosta.
-# Lepsze jest po prostu użycie @bot.event dla jednej funkcji on_ready.
-# Zakładając, że `on_ready_final` z poprzedniego kroku było jedynym, to wystarczy zmienić jego nazwę i zawartość.
-
-# Poprzednia linia `bot.event(on_ready_with_all_tasks_including_polls)` została usunięta,
-# a nowa funkcja `on_ready_setup` jest dekorowana `@bot.event` co jest standardowym sposobem.
-# Upewniam się, że `on_ready_final` nie jest już używane, a `on_ready_setup` jest.
-# Zastąpiłem wcześniejsze `bot.event(on_ready_final)` nową dekoracją.
-# Wszystkie poprzednie `bot.on_ready = nazwa_funkcji` powinny być usunięte.
-# Powyższa funkcja `on_ready_setup` staje się jedynym handlerem `@bot.event` dla `on_ready`.
-
 @bot.tree.command(name="close_poll", description="Manualnie zamyka aktywną ankietę i ogłasza wyniki.")
 @app_commands.describe(id_wiadomosci_ankiety="ID wiadomości, na której znajduje się ankieta do zamknięcia.")
-@app_commands.checks.has_permissions(manage_guild=True) # Lub inne odpowiednie uprawnienie
+@app_commands.checks.has_permissions(manage_guild=True)
 async def close_poll_command(interaction: discord.Interaction, id_wiadomosci_ankiety: str):
     if not interaction.guild_id or not interaction.guild:
         await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
@@ -372,45 +662,37 @@ async def close_poll_command(interaction: discord.Interaction, id_wiadomosci_ank
         await interaction.response.send_message(f"Ankieta (ID: {poll_data['id']}) jest już zamknięta.", ephemeral=True)
         return
 
-    # Potwierdzenie od moderatora, że na pewno chce zamknąć
-    # Można by tu dodać przyciski Tak/Nie, ale dla uproszczenia na razie zamykamy od razu.
-    # await interaction.response.send_message(f"Czy na pewno chcesz zamknąć ankietę '{poll_data['question']}' (ID: {poll_data['id']})?", ephemeral=True, view=ConfirmView())
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
-    await interaction.response.defer(ephemeral=True, thinking=True) # Daj znać, że pracujemy
+    guild = interaction.guild
 
-    guild = interaction.guild # Mamy pewność, że jest, bo sprawdziliśmy guild_id
-    channel = guild.get_channel(poll_data["channel_id"])
-
-    if not channel or not isinstance(channel, discord.TextChannel):
-        print(f"[CLOSE_POLL] Nie znaleziono kanału {poll_data['channel_id']} dla ankiety ID {poll_data['id']}. Zamykam w bazie.")
-        database.close_poll(poll_data["id"])
-        await interaction.followup.send(f"Nie znaleziono kanału ankiety. Ankieta (ID: {poll_data['id']}) została zamknięta w bazie.", ephemeral=True)
-        return
-
+    giveaway_message = None # Zmieniono nazwę zmiennej dla jasności
     try:
-        poll_message = await channel.fetch_message(poll_data["message_id"])
-    except discord.NotFound:
-        print(f"[CLOSE_POLL] Nie znaleziono wiadomości ankiety {poll_data['message_id']} dla ankiety ID {poll_data['id']}. Zamykam w bazie.")
-        database.close_poll(poll_data["id"])
-        await interaction.followup.send(f"Nie znaleziono oryginalnej wiadomości ankiety. Ankieta (ID: {poll_data['id']}) została zamknięta w bazie.", ephemeral=True)
-        return
+        channel = guild.get_channel(poll_data["channel_id"])
+        if channel and isinstance(channel, discord.TextChannel):
+             giveaway_message = await channel.fetch_message(poll_data["message_id"])
     except Exception as e:
-        print(f"[CLOSE_POLL] Błąd przy pobieraniu wiadomości ankiety {poll_data['message_id']}: {e}. Zamykam w bazie.")
+        print(f"Błąd pobierania wiadomości dla /close_poll {message_id}: {e}")
+
+    if not giveaway_message: # Jeśli nie udało się pobrać wiadomości ankiety
         database.close_poll(poll_data["id"])
-        await interaction.followup.send(f"Wystąpił błąd przy dostępie do wiadomości ankiety. Ankieta (ID: {poll_data['id']}) została zamknięta w bazie.", ephemeral=True)
+        await interaction.followup.send("Nie znaleziono oryginalnej wiadomości ankiety. Ankieta została zamknięta w bazie bez ogłaszania wyników.", ephemeral=True)
         return
+
+    # Użyj _handle_giveaway_end_logic - pomyłka, to powinno być dla ankiet
+    # Trzeba zrefaktoryzować logikę kończenia ankiety do osobnej funkcji, tak jak dla konkursów.
+    # Na razie skopiuję i dostosuję logikę z check_expired_polls_task.
 
     poll_options = database.get_poll_options(poll_data["id"])
-    if not poll_options: # Powinno być niemożliwe, jeśli ankieta została poprawnie stworzona
+    if not poll_options:
         print(f"[CLOSE_POLL] Brak opcji dla ankiety ID {poll_data['id']}. Zamykam w bazie.")
         database.close_poll(poll_data["id"])
         await interaction.followup.send(f"Brak opcji dla ankiety. Ankieta (ID: {poll_data['id']}) została zamknięta w bazie.", ephemeral=True)
         return
 
-    # Logika zliczania głosów i wysyłania wyników (taka sama jak w check_expired_polls_task)
     results = {}
     total_votes = 0
-    for reaction in poll_message.reactions:
+    for reaction in giveaway_message.reactions: # giveaway_message to tak naprawdę poll_message
         emoji_str = str(reaction.emoji)
         is_option_emoji = any(opt['reaction_emoji'] == emoji_str for opt in poll_options)
         if is_option_emoji:
@@ -421,7 +703,7 @@ async def close_poll_command(interaction: discord.Interaction, id_wiadomosci_ank
 
     results_embed = discord.Embed(
         title=f"📊 Wyniki Ankiety (Zamknięta Manualnie): {poll_data['question']}",
-        color=discord.Color.dark_red(), # Inny kolor dla manualnego zamknięcia
+        color=discord.Color.dark_red(),
         timestamp=datetime.utcnow()
     )
     results_description_parts = []
@@ -443,30 +725,31 @@ async def close_poll_command(interaction: discord.Interaction, id_wiadomosci_ank
     if creator:
         results_embed.set_footer(text=f"Ankieta ID: {poll_data['id']} | Zamknięta przez: {interaction.user.display_name}")
 
-    results_message = None
+    results_message_obj = None
     try:
-        results_message = await channel.send(embed=results_embed)
+        results_message_obj = await giveaway_message.channel.send(embed=results_embed) # Użyj giveaway_message.channel
         try:
-            original_embed = poll_message.embeds[0] if poll_message.embeds else None
+            original_embed = giveaway_message.embeds[0] if giveaway_message.embeds else None
             if original_embed:
                 new_embed_data = original_embed.to_dict()
                 new_embed_data['title'] = "[ZAMKNIĘTA MANUALNIE] " + new_embed_data.get('title', poll_data['question'])
                 new_embed_data['color'] = discord.Color.dark_grey().value
                 if 'fields' in new_embed_data:
                     new_embed_data['fields'] = [f for f in new_embed_data['fields'] if f['name'] != "Koniec głosowania"]
-                new_embed_data.setdefault('fields', []).append({'name': "Wyniki", 'value': f"[Zobacz wyniki]({results_message.jump_url})", 'inline': False})
+                new_embed_data.setdefault('fields', []).append({'name': "Wyniki", 'value': f"[Zobacz wyniki]({results_message_obj.jump_url})", 'inline': False})
                 final_embed = discord.Embed.from_dict(new_embed_data)
-                await poll_message.edit(embed=final_embed, view=None)
-                await poll_message.clear_reactions()
+                await giveaway_message.edit(embed=final_embed, view=None)
+                await giveaway_message.clear_reactions()
         except Exception as e_edit:
             print(f"[CLOSE_POLL] Nie udało się edytować oryginalnej wiadomości ankiety ID {poll_data['message_id']}: {e_edit}")
 
-        database.close_poll(poll_data["id"], results_message_id=results_message.id if results_message else None)
+        database.close_poll(poll_data["id"], results_message_id=results_message_obj.id if results_message_obj else None)
         await interaction.followup.send(f"Ankieta (ID: {poll_data['id']}) została zamknięta. Wyniki ogłoszone.", ephemeral=True)
     except Exception as e_send_results:
         print(f"[CLOSE_POLL] Błąd wysyłania wyników ankiety ID {poll_data['id']}: {e_send_results}")
-        database.close_poll(poll_data["id"]) # Mimo wszystko zamknij w bazie
+        database.close_poll(poll_data["id"])
         await interaction.followup.send(f"Wystąpił błąd podczas ogłaszania wyników, ale ankieta (ID: {poll_data['id']}) została zamknięta w bazie.", ephemeral=True)
+
 
 @close_poll_command.error
 async def close_poll_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -815,8 +1098,8 @@ async def list_activity_roles_command(interaction: discord.Interaction):
 
 
 # --- Event `on_message` (nazwa zmieniona na `on_message_with_quiz_and_more`) ---
-@bot.event # Dodajemy dekorator @bot.event
-async def on_message_with_quiz_and_more(message: discord.Message): # Zmieniona nazwa
+@bot.event
+async def on_message(message: discord.Message):
     # 1. Obsługa odpowiedzi na quiz w DM
     if isinstance(message.channel, discord.DMChannel) and message.author.id in active_quizzes and not message.author.bot:
         user_id_quiz = message.author.id
@@ -834,8 +1117,7 @@ async def on_message_with_quiz_and_more(message: discord.Message): # Zmieniona n
     # 3. Logika Moderacji (jeśli wiadomość z serwera i nie od bota)
     message_deleted_by_moderation = False
     server_config_mod = database.get_server_config(message.guild.id)
-    if server_config_mod: # Tylko jeśli jest jakakolwiek konfiguracja serwera
-        # Filtr Wulgaryzmów
+    if server_config_mod:
         if server_config_mod.get("filter_profanity_enabled", True):
             banned_words_list = database.get_banned_words(message.guild.id)
             if banned_words_list:
@@ -850,7 +1132,6 @@ async def on_message_with_quiz_and_more(message: discord.Message): # Zmieniona n
                             except: pass
                         except Exception as e: print(f"Błąd auto-moderacji (profanity): {e}")
                         break
-        # Filtr Linków Zapraszających
         if not message_deleted_by_moderation and server_config_mod.get("filter_invites_enabled", True):
             invite_pattern = r"(discord\.(gg|me|io|com\/invite)\/[a-zA-Z0-9]+)"
             if re.search(invite_pattern, message.content, re.IGNORECASE):
@@ -861,7 +1142,6 @@ async def on_message_with_quiz_and_more(message: discord.Message): # Zmieniona n
                     try: await message.author.send(f"Twoja wiadomość na **{message.guild.name}** została usunięta (linki zapraszające).")
                     except: pass
                 except Exception as e: print(f"Błąd auto-moderacji (invites): {e}")
-        # Filtr Spamu
         if not message_deleted_by_moderation and server_config_mod.get("filter_spam_enabled", True):
             user_msgs = user_recent_messages[message.author.id]
             user_msgs.append(message.content)
@@ -883,7 +1163,7 @@ async def on_message_with_quiz_and_more(message: discord.Message): # Zmieniona n
                 except Exception as e: print(f"Błąd auto-moderacji (spam-mentions): {e}")
 
     if message_deleted_by_moderation:
-        return # Nie przetwarzaj dalej dla XP itp.
+        return
 
     # 4. Logika XP i Poziomów (jeśli wiadomość nie została usunięta)
     guild_id = message.guild.id
@@ -904,12 +1184,9 @@ async def on_message_with_quiz_and_more(message: discord.Message): # Zmieniona n
         if calculated_level_xp > current_level_db_xp:
             database.set_user_level(guild_id, user_id, calculated_level_xp)
             try:
-                # Wiadomość o awansie - początek
                 level_up_message_parts = [f"🎉 Gratulacje {message.author.mention}! Osiągnąłeś/aś **Poziom {calculated_level_xp}**!"]
-
-                # Pobierz i przyznaj nagrody za poziom
                 level_rewards = database.get_rewards_for_level(guild_id, calculated_level_xp)
-                awarded_roles_mentions = [] # Lista do zbierania wzmianek nadanych ról
+                awarded_roles_mentions = []
 
                 if level_rewards:
                     member_obj = message.author
@@ -950,22 +1227,22 @@ async def on_message_with_quiz_and_more(message: discord.Message): # Zmieniona n
             except Exception as e_lvl_up:
                 print(f"Błąd podczas przetwarzania awansu i nagród dla {message.author.name}: {e_lvl_up}")
 
-    # 5. Obsługa komend tekstowych (jeśli są) - powinna być na końcu, jeśli wiadomość nie została usunięta i nie była odpowiedzią na quiz.
+    # 5. Obsługa komend tekstowych (jeśli są)
     # await bot.process_commands(message)
 
-bot.on_message(on_message_with_quiz_and_more) # Rejestracja nowego handlera on_message
+bot.on_message = on_message # Zmieniono nazwę handlera i sposób rejestracji
 
 
 # Komenda /rank
 @bot.tree.command(name="rank", description="Wyświetla Twój aktualny poziom i postęp XP (lub innego użytkownika).")
 @app_commands.describe(uzytkownik="Użytkownik, którego statystyki chcesz zobaczyć (opcjonalnie).")
 async def rank_command(interaction: discord.Interaction, uzytkownik: discord.Member = None):
-    if not interaction.guild_id or not interaction.guild: # Dodane sprawdzenie guild
+    if not interaction.guild_id or not interaction.guild:
         await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
         return
 
     target_user = uzytkownik if uzytkownik else interaction.user
-    if not isinstance(target_user, discord.Member): # Upewnij się, że to Member
+    if not isinstance(target_user, discord.Member):
         target_user_fetched = interaction.guild.get_member(target_user.id)
         if not target_user_fetched:
             await interaction.response.send_message("Nie udało się znaleźć tego użytkownika na serwerze.", ephemeral=True)
@@ -982,27 +1259,29 @@ async def rank_command(interaction: discord.Interaction, uzytkownik: discord.Mem
     xp_needed_for_level_up_from_current = xp_for_next_level_gate - xp_for_current_level_gate
 
     xp_display = f"{current_xp} XP"
-    progress_bar = "█" * 10 + " (MAX POZIOM)"
+    progress_bar = "█" * 10 + " (MAX POZIOM)" # Domyślnie, jeśli nie ma następnego poziomu
     progress_percentage = 100.0
 
-    if xp_needed_for_level_up_from_current > 0 :
+    if xp_needed_for_level_up_from_current > 0 : # Normalny postęp
         progress_percentage = (xp_in_current_level / xp_needed_for_level_up_from_current) * 100
         filled_blocks = int(progress_percentage / 10)
         empty_blocks = 10 - filled_blocks
         progress_bar = "█" * filled_blocks + "░" * empty_blocks
-        xp_display = f"{xp_in_current_level} / {xp_needed_for_level_up_from_current} XP na tym poziomie (Całkowite: {current_xp})"
-    elif current_level == 0 and xp_for_next_level_gate > 0 : # Specjalny przypadek dla poziomu 0
+        xp_display = f"{xp_in_current_level:,} / {xp_needed_for_level_up_from_current:,} XP na tym poziomie (Całkowite: {current_xp:,})"
+    elif current_level == 0 and xp_for_next_level_gate > 0 : # Poziom 0, postęp do poziomu 1
         progress_percentage = (current_xp / xp_for_next_level_gate) * 100
         filled_blocks = int(progress_percentage / 10)
         empty_blocks = 10 - filled_blocks
         progress_bar = "█" * filled_blocks + "░" * empty_blocks
-        xp_display = f"{current_xp} / {xp_for_next_level_gate} XP (Całkowite: {current_xp})"
+        xp_display = f"{current_xp:,} / {xp_for_next_level_gate:,} XP (Całkowite: {current_xp:,})"
+    else: # Brak zdefiniowanego następnego poziomu (lub błąd w formule dla level 0)
+        xp_display = f"Całkowite XP: {current_xp:,}"
 
 
     embed = discord.Embed(title=f"Statystyki Aktywności dla {target_user.display_name}", color=discord.Color.green() if target_user == interaction.user else discord.Color.blue())
     embed.set_thumbnail(url=target_user.display_avatar.url)
     embed.add_field(name="Poziom", value=f"**{current_level}**", inline=True)
-    embed.add_field(name="Całkowite XP", value=f"**{current_xp}**", inline=True)
+    embed.add_field(name="Całkowite XP", value=f"**{current_xp:,}**", inline=True) # Dodane formatowanie z przecinkami
 
     rank_info = database.get_user_rank_in_server(interaction.guild_id, target_user.id)
     rank_display = "Brak w rankingu (0 XP)"
@@ -1013,8 +1292,65 @@ async def rank_command(interaction: discord.Interaction, uzytkownik: discord.Mem
     embed.add_field(name=f"Postęp do Poziomu {current_level + 1}", value=f"{progress_bar} ({progress_percentage:.2f}%)\n{xp_display}", inline=False)
     await interaction.response.send_message(embed=embed)
 
-# --- System Weryfikacji Quizem --- (reszta kodu bez zmian)
-# ... (cała reszta kodu aż do końca pliku)
-[end of main.py]
+@bot.tree.command(name="leaderboard", description="Wyświetla ranking top 10 użytkowników na serwerze pod względem XP.")
+@app_commands.describe(strona="Numer strony leaderboardu (opcjonalnie).")
+async def leaderboard_command(interaction: discord.Interaction, strona: int = 1):
+    if not interaction.guild_id or not interaction.guild:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
 
+    if strona <= 0: strona = 1
+    limit_per_page = 10
+    offset = (strona - 1) * limit_per_page
+
+    leaderboard_data = database.get_server_leaderboard(interaction.guild_id, limit=limit_per_page, offset=offset)
+
+    if not leaderboard_data:
+        if strona == 1:
+            await interaction.response.send_message("Nikt jeszcze nie zdobył XP na tym serwerze!", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Brak użytkowników na stronie {strona} leaderboardu.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"🏆 Leaderboard Aktywności - Strona {strona}",
+        color=discord.Color.gold(),
+        timestamp=datetime.utcnow()
+    )
+    embed.set_footer(text=f"Serwer: {interaction.guild.name}")
+
+    description_lines = []
+    for i, entry in enumerate(leaderboard_data):
+        user_obj = interaction.guild.get_member(entry["user_id"])
+        if not user_obj:
+            try:
+                user_obj = await bot.fetch_user(entry["user_id"])
+                user_display_name = user_obj.global_name or user_obj.name
+            except discord.NotFound:
+                user_display_name = f"ID: {entry['user_id']} (Nieznany)"
+        else:
+            user_display_name = user_obj.mention
+
+        rank_pos = offset + i + 1
+        description_lines.append(
+            f"**{rank_pos}.** {user_display_name} - Poziom: **{entry['level']}** (XP: {entry['xp']:,})" # Formatowanie XP
+        )
+
+    embed.description = "\n".join(description_lines)
+
+    # Sprawdzenie, czy jest następna strona
+    # Aby to zrobić poprawnie, potrzebujemy znać całkowitą liczbę użytkowników w rankingu.
+    # Możemy to uzyskać np. przez `get_user_rank_in_server` dla dowolnego użytkownika z XP lub osobną funkcję.
+    # Na razie uproszczenie: jeśli pobraliśmy pełną stronę (limit_per_page), jest szansa na następną.
+    if len(leaderboard_data) == limit_per_page:
+        # Sprawdź, czy istnieje przynajmniej jeden kolejny użytkownik
+        next_page_check = database.get_server_leaderboard(interaction.guild_id, limit=1, offset=strona * limit_per_page)
+        if next_page_check:
+             embed.add_field(name="\u200b", value=f"Użyj `/leaderboard strona:{strona + 1}` aby zobaczyć następną stronę.", inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+# --- System Weryfikacji Quizem ---
+# ... (reszta kodu bez zmian)
 [end of main.py]
