@@ -15,6 +15,13 @@ TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 # Klucz: (guild_id, user_id), Wartość: timestamp ostatniego przyznania XP
 last_xp_gain_timestamp = {}
 
+# Do śledzenia ostatnich wiadomości użytkowników dla filtru spamu
+import collections
+user_recent_messages = collections.defaultdict(lambda: collections.deque(maxlen=3)) # Przechowuj 3 ostatnie wiadomości
+
+# Do regexów
+import re
+
 # Definiujemy intencje, w tym guilds i members, które mogą być potrzebne
 intents = discord.Intents.default()
 intents.message_content = True # Jeśli nadal potrzebne dla starych komend tekstowych lub innych funkcji
@@ -814,6 +821,210 @@ async def set_unverified_role_error(interaction: discord.Interaction, error: app
     else:
         await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)
 
+# --- Komendy Konfiguracyjne Moderacji ---
+
+@bot.tree.command(name="set_modlog_channel", description="Ustawia kanał, na który będą wysyłane logi moderacyjne.")
+@app_commands.describe(kanal="Kanał tekstowy dla logów moderacyjnych.")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_modlog_channel_command(interaction: discord.Interaction, kanal: discord.TextChannel):
+    if not interaction.guild_id:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+    try:
+        database.update_server_config(guild_id=interaction.guild_id, moderation_log_channel_id=kanal.id)
+        await interaction.response.send_message(f"Kanał logów moderacyjnych został ustawiony na {kanal.mention}.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Wystąpił błąd podczas ustawiania kanału: {e}", ephemeral=True)
+
+@set_modlog_channel_command.error
+async def set_modlog_channel_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień administratora.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)
+
+
+@bot.tree.command(name="add_banned_word", description="Dodaje słowo lub frazę do czarnej listy (filtr wulgaryzmów).")
+@app_commands.describe(slowo="Słowo lub fraza do zablokowania (wielkość liter ignorowana).")
+@app_commands.checks.has_permissions(administrator=True)
+async def add_banned_word_command(interaction: discord.Interaction, slowo: str):
+    if not interaction.guild_id:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    normalized_word = slowo.lower().strip()
+    if not normalized_word:
+        await interaction.response.send_message("Słowo nie może być puste.", ephemeral=True)
+        return
+
+    if database.add_banned_word(interaction.guild_id, normalized_word):
+        await interaction.response.send_message(f"Słowo/fraza \"{normalized_word}\" została dodana do czarnej listy.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Słowo/fraza \"{normalized_word}\" już jest na czarnej liście.", ephemeral=True)
+
+@add_banned_word_command.error
+async def add_banned_word_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień administratora.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)
+
+
+@bot.tree.command(name="remove_banned_word", description="Usuwa słowo lub frazę z czarnej listy.")
+@app_commands.describe(slowo="Słowo lub fraza do usunięcia (wielkość liter ignorowana).")
+@app_commands.checks.has_permissions(administrator=True)
+async def remove_banned_word_command(interaction: discord.Interaction, slowo: str):
+    if not interaction.guild_id:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    normalized_word = slowo.lower().strip()
+    if not normalized_word:
+        await interaction.response.send_message("Słowo nie może być puste.", ephemeral=True)
+        return
+
+    if database.remove_banned_word(interaction.guild_id, normalized_word):
+        await interaction.response.send_message(f"Słowo/fraza \"{normalized_word}\" została usunięta z czarnej listy.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Słowa/frazy \"{normalized_word}\" nie było na czarnej liście.", ephemeral=True)
+
+@remove_banned_word_command.error
+async def remove_banned_word_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień administratora.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)
+
+
+@bot.tree.command(name="list_banned_words", description="Wyświetla listę zakazanych słów/fraz.")
+@app_commands.checks.has_permissions(administrator=True)
+async def list_banned_words_command(interaction: discord.Interaction):
+    if not interaction.guild_id:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    words = database.get_banned_words(interaction.guild_id)
+    if not words:
+        await interaction.response.send_message("Czarna lista słów jest pusta.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title=f"Czarna Lista Słów dla {interaction.guild.name}", color=discord.Color.red())
+    # Paginacja dla długiej listy
+    description_parts = []
+    current_part = ""
+    for word in sorted(words):
+        if len(current_part) + len(word) + 2 > 1900: # Zostaw trochę miejsca na formatowanie i ewentualne znaki nowej linii
+            description_parts.append(current_part)
+            current_part = ""
+        current_part += f"- {word}\n"
+    description_parts.append(current_part) # Dodaj ostatnią część
+
+    first_embed_sent = False
+    for i, part in enumerate(description_parts):
+        if not part.strip(): continue # Pomiń puste części
+
+        part_title = embed.title if i == 0 else f"{embed.title} (cd.)"
+        page_embed = discord.Embed(title=part_title, description=part, color=discord.Color.red())
+
+        if not first_embed_sent:
+            await interaction.response.send_message(embed=page_embed, ephemeral=True)
+            first_embed_sent = True
+        else:
+            await interaction.followup.send(embed=page_embed, ephemeral=True)
+
+    if not first_embed_sent: # Jeśli lista była pusta po sortowaniu/filtrowaniu (np. same puste słowa)
+         await interaction.response.send_message("Czarna lista słów jest pusta lub zawiera tylko puste wpisy.", ephemeral=True)
+
+
+@list_banned_words_command.error
+async def list_banned_words_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień administratora.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)
+
+
+@bot.tree.command(name="toggle_filter", description="Włącza lub wyłącza określony filtr moderacyjny.")
+@app_commands.describe(filtr="Nazwa filtru do przełączenia.", status="Nowy status filtru (on/off).")
+@app_commands.choices(filtr=[
+    app_commands.Choice(name="Wulgaryzmy (Profanity)", value="profanity"),
+    app_commands.Choice(name="Spam", value="spam"),
+    app_commands.Choice(name="Linki Zapraszające (Invites)", value="invites"),
+])
+@app_commands.choices(status=[
+    app_commands.Choice(name="Włączony (On)", value="on"),
+    app_commands.Choice(name="Wyłączony (Off)", value="off"),
+])
+@app_commands.checks.has_permissions(administrator=True)
+async def toggle_filter_command(interaction: discord.Interaction, filtr: app_commands.Choice[str], status: app_commands.Choice[str]):
+    if not interaction.guild_id:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    new_status_bool = status.value == "on"
+    filter_name_db = ""
+    filter_name_display = filtr.name
+
+    if filtr.value == "profanity":
+        filter_name_db = "filter_profanity_enabled"
+    elif filtr.value == "spam":
+        filter_name_db = "filter_spam_enabled"
+    elif filtr.value == "invites":
+        filter_name_db = "filter_invites_enabled"
+    else:
+        await interaction.response.send_message("Nieznany typ filtru.", ephemeral=True)
+        return
+
+    try:
+        update_kwargs = {filter_name_db: new_status_bool}
+        database.update_server_config(guild_id=interaction.guild_id, **update_kwargs)
+        await interaction.response.send_message(f"Filtr '{filter_name_display}' został {'włączony' if new_status_bool else 'wyłączony'}.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Wystąpił błąd podczas aktualizacji statusu filtru: {e}", ephemeral=True)
+
+@toggle_filter_command.error
+async def toggle_filter_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień administratora.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)
+
+
+@bot.tree.command(name="moderation_settings", description="Wyświetla aktualne ustawienia moderacji serwera.")
+@app_commands.checks.has_permissions(administrator=True)
+async def moderation_settings_command(interaction: discord.Interaction):
+    if not interaction.guild_id or not interaction.guild:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    config = database.get_server_config(interaction.guild_id)
+    if not config: # Powinno być utworzone przez INSERT OR IGNORE w update_server_config
+        # Ale get_server_config zwraca domyślne wartości jeśli niektóre pola są None,
+        # a None jeśli w ogóle nie ma wpisu dla guild_id.
+        # Zakładając, że wpis istnieje, ale wartości mogą być None (co get_server_config obsługuje dając default)
+        # Jeśli config jest None, to znaczy, że nawet INSERT OR IGNORE nie zadziałał lub nie było żadnej interakcji z configiem.
+        # Możemy stworzyć tu domyślny config dla celów wyświetlania lub poinformować, że nic nie ustawiono.
+        # Dla bezpieczeństwa, jeśli config is None, to znaczy, że nie ma wpisu.
+         database.update_server_config(interaction.guild_id) # Utwórz domyślny wpis
+         config = database.get_server_config(interaction.guild_id) # Pobierz ponownie
+
+    log_channel = interaction.guild.get_channel(config.get("moderation_log_channel_id")) if config.get("moderation_log_channel_id") else "Nie ustawiono"
+
+    embed = discord.Embed(title=f"Ustawienia Moderacji dla {interaction.guild.name}", color=discord.Color.gold())
+    embed.add_field(name="Kanał Logów Moderacyjnych", value=log_channel.mention if isinstance(log_channel, discord.TextChannel) else str(log_channel), inline=False)
+    embed.add_field(name="Filtr Wulgaryzmów", value="✅ Włączony" if config.get("filter_profanity_enabled", True) else "❌ Wyłączony", inline=True)
+    embed.add_field(name="Filtr Spamu", value="✅ Włączony" if config.get("filter_spam_enabled", True) else "❌ Wyłączony", inline=True)
+    embed.add_field(name="Filtr Linków Zapraszających", value="✅ Włączony" if config.get("filter_invites_enabled", True) else "❌ Wyłączony", inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@moderation_settings_command.error
+async def moderation_settings_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień administratora.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)
+
 # Event dla dołączającego użytkownika - nadanie roli Nieweryfikowany
 @bot.event
 async def on_member_join(member: discord.Member):
@@ -1100,29 +1311,185 @@ async def on_message_with_quiz(message: discord.Message):
                         print(f"Nie udało się wysłać wiadomości o awansie na kanale {message.channel.name} (brak uprawnień).")
         # --- Koniec skopiowanej logiki ---
 
+    # --- Logika Moderacji ---
+    # Ta sekcja powinna być tylko dla wiadomości na serwerze (message.guild istnieje)
+    # i nie od botów, i nie przetworzona już jako odpowiedź na quiz.
+    # Warunek `message.guild` jest już sprawdzony na początku `on_message_with_quiz` dla logiki XP.
+    # Musimy upewnić się, że nie moderujemy odpowiedzi na quiz w DM.
+
+    # Sprawdź, czy to nie jest odpowiedź na quiz w DM, zanim przejdziesz do moderacji
+    if not (isinstance(message.channel, discord.DMChannel) and message.author.id in active_quizzes):
+        if message.guild and not message.author.bot:
+            # Sprawdź, czy autor nie jest administratorem lub nie ma uprawnień zarządzania wiadomościami
+            # (opcjonalne, aby nie moderować adminów/modów)
+            # if not message.author.guild_permissions.manage_messages: # Przykład
+
+            server_config_mod = database.get_server_config(message.guild.id)
+            if not server_config_mod: # Jeśli nie ma configu, nie ma co moderować
+                # await bot.process_commands(message) # Jeśli są komendy tekstowe
+                return
+
+            message_deleted = False # Flaga, aby nie przetwarzać XP jeśli wiadomość usunięta
+
+            # 1. Filtr Wulgaryzmów
+            if server_config_mod.get("filter_profanity_enabled", True) and not message_deleted:
+                banned_words_list = database.get_banned_words(message.guild.id)
+                if banned_words_list:
+                    # Tworzymy regex, który dopasuje całe słowa, case-insensitive
+                    # \b na granicach słów, aby uniknąć np. "ass" w "grass"
+                    # Używamy re.escape, aby specjalne znaki w słowach były traktowane dosłownie
+                    # regex_pattern = r"(?i)\b(" + "|".join(re.escape(word) for word in banned_words_list) + r")\b"
+                    # Prostsze sprawdzenie:
+                    for banned_word in banned_words_list:
+                        # Użycie \bword\b jest dobre, ale może być wolne dla wielu słów.
+                        # Prostsze: ' ' + word + ' ' lub na początku/końcu linii.
+                        # Lub po prostu `if banned_word in message.content.lower():` jeśli akceptujemy częściowe dopasowania
+                        # Dla bardziej precyzyjnego dopasowania całych słów, użyjemy regexu z word boundaries \b
+                        # Trzeba uważać na znaki specjalne w banned_word, jeśli nie używamy re.escape
+                        # Bezpieczniejsze jest iterowanie i sprawdzanie `\bword\b` dla każdego słowa.
+                        # To jest bardziej odporne na znaki specjalne w słowach z bazy.
+                        pattern = r"(?i)\b" + re.escape(banned_word) + r"\b"
+                        if re.search(pattern, message.content):
+                            try:
+                                await message.delete()
+                                await log_moderation_action(
+                                    message.guild, message.author, message.content,
+                                    f"Wykryto zakazane słowo/frazę: '{banned_word}'",
+                                    message.channel, server_config_mod.get("moderation_log_channel_id")
+                                )
+                                message_deleted = True
+                                # Można wysłać ostrzeżenie do użytkownika w DM
+                                try:
+                                    await message.author.send(f"Twoja wiadomość na serwerze **{message.guild.name}** została usunięta, ponieważ zawierała niedozwolone słownictwo.")
+                                except discord.Forbidden:
+                                    pass # Nie można wysłać DM
+                                break # Przerywamy pętlę po pierwszym znalezionym słowie
+                            except discord.Forbidden:
+                                print(f"Błąd moderacji (profanity): Brak uprawnień do usunięcia wiadomości na {message.guild.name}.")
+                            except Exception as e:
+                                print(f"Błąd moderacji (profanity): {e}")
+                            break
+
+            # 2. Filtr Linków Zapraszających Discord
+            if server_config_mod.get("filter_invites_enabled", True) and not message_deleted:
+                invite_pattern = r"(discord\.(gg|me|io|com\/invite)\/[a-zA-Z0-9]+)"
+                if re.search(invite_pattern, message.content, re.IGNORECASE):
+                    try:
+                        await message.delete()
+                        await log_moderation_action(
+                            message.guild, message.author, message.content,
+                            "Wykryto link zapraszający do Discorda.",
+                            message.channel, server_config_mod.get("moderation_log_channel_id")
+                        )
+                        message_deleted = True
+                        try:
+                            await message.author.send(f"Twoja wiadomość na serwerze **{message.guild.name}** została usunięta, ponieważ zawierała link zapraszający.")
+                        except discord.Forbidden:
+                            pass
+                    except discord.Forbidden:
+                        print(f"Błąd moderacji (invites): Brak uprawnień do usunięcia wiadomości na {message.guild.name}.")
+                    except Exception as e:
+                        print(f"Błąd moderacji (invites): {e}")
+
+            # 3. Filtr Spamu (Podstawowy)
+            if server_config_mod.get("filter_spam_enabled", True) and not message_deleted:
+                # a) Powtarzające się wiadomości
+                user_msgs = user_recent_messages[message.author.id]
+                user_msgs.append(message.content) # deque automatycznie usunie najstarszą jeśli maxlen osiągnięty
+                if len(user_msgs) == user_msgs.maxlen: # Mamy wystarczająco wiadomości do porównania
+                    # Sprawdź, czy wszystkie (lub np. 2 z 3) są takie same
+                    if len(set(user_msgs)) == 1: # Wszystkie wiadomości w deque są identyczne
+                        try:
+                            await message.delete()
+                            await log_moderation_action(
+                                message.guild, message.author, message.content,
+                                "Wykryto powtarzające się wiadomości (spam).",
+                                message.channel, server_config_mod.get("moderation_log_channel_id")
+                            )
+                            message_deleted = True
+                            try:
+                                await message.author.send(f"Twoja wiadomość na serwerze **{message.guild.name}** została usunięta z powodu spamu (powtarzanie treści).")
+                            except discord.Forbidden:
+                                pass
+                        except discord.Forbidden:
+                             print(f"Błąd moderacji (spam-repeat): Brak uprawnień do usunięcia wiadomości na {message.guild.name}.")
+                        except Exception as e:
+                            print(f"Błąd moderacji (spam-repeat): {e}")
+
+                # b) Nadmierne wzmianki (jeśli wiadomość nie została już usunięta)
+                if not message_deleted and (len(message.mentions) + len(message.role_mentions) > 5): # Np. próg 5 wzmianek
+                    try:
+                        await message.delete()
+                        await log_moderation_action(
+                            message.guild, message.author, message.content,
+                            "Wykryto nadmierną liczbę wzmianek (spam).",
+                            message.channel, server_config_mod.get("moderation_log_channel_id")
+                        )
+                        message_deleted = True
+                        try:
+                            await message.author.send(f"Twoja wiadomość na serwerze **{message.guild.name}** została usunięta z powodu nadmiernej liczby wzmianek.")
+                        except discord.Forbidden:
+                            pass
+                    except discord.Forbidden:
+                        print(f"Błąd moderacji (spam-mentions): Brak uprawnień do usunięcia wiadomości na {message.guild.name}.")
+                    except Exception as e:
+                        print(f"Błąd moderacji (spam-mentions): {e}")
+
+            # Jeśli wiadomość została usunięta przez moderację, nie przyznawaj XP i nie przetwarzaj dalej dla ról za aktywność
+            if message_deleted:
+                # await bot.process_commands(message) # Jeśli są komendy tekstowe, mogą być nadal przetwarzane
+                return
+
 
     # Logika dla odpowiedzi na quiz w DM
     if isinstance(message.channel, discord.DMChannel) and message.author.id in active_quizzes and not message.author.bot:
         user_id = message.author.id
         quiz_state = active_quizzes[user_id]
 
-        # Sprawdź, czy użytkownik nie próbuje odpowiedzieć na już zakończony quiz (teoretycznie niemożliwe jeśli usuwamy ze słownika)
         if quiz_state["current_q_index"] >= len(quiz_state["questions"]):
-             # await message.author.send("Quiz został już zakończony lub wystąpił błąd.")
-             return # Nic nie rób, quiz już przetworzony lub w trakcie przetwarzania
+             return
 
         quiz_state["answers"].append(message.content)
         quiz_state["current_q_index"] += 1
 
-        # Wyślij następne pytanie lub zakończ quiz
         await send_quiz_question_dm(message.author)
-        return # Ważne, aby nie przetwarzać dalej jako zwykłą wiadomość
+        return
 
-    # Jeśli używasz komend tekstowych z prefixem, i nie jest to odpowiedź na quiz DM
-    # if not (isinstance(message.channel, discord.DMChannel) and message.author.id in active_quizzes):
-    #    await bot.process_commands(message)
+    # await bot.process_commands(message)
 
 bot.on_message = on_message_with_quiz # Nadpisz standardowy on_message
+
+
+async def log_moderation_action(guild: discord.Guild, author: discord.User, deleted_content: str, reason: str,
+                                channel_where_deleted: discord.TextChannel, mod_log_channel_id: int | None):
+    if not mod_log_channel_id:
+        return # Brak skonfigurowanego kanału logów
+
+    log_channel = guild.get_channel(mod_log_channel_id)
+    if not log_channel or not isinstance(log_channel, discord.TextChannel):
+        print(f"Błąd logowania moderacji: Nie znaleziono kanału logów (ID: {mod_log_channel_id}) na serwerze {guild.name} lub nie jest to kanał tekstowy.")
+        return
+
+    embed = discord.Embed(title="Akcja Moderacyjna", color=discord.Color.orange(), timestamp=discord.utils.utcnow())
+    embed.add_field(name="Użytkownik", value=f"{author.mention} ({author.id})", inline=False)
+    embed.add_field(name="Kanał", value=channel_where_deleted.mention, inline=False)
+    embed.add_field(name="Powód", value=reason, inline=False)
+
+    # Ogranicz długość treści wiadomości w logu
+    truncated_content = deleted_content
+    if len(deleted_content) > 1000:
+        truncated_content = deleted_content[:1000] + "..."
+    embed.add_field(name="Usunięta treść", value=f"```{truncated_content}```" if truncated_content else "```(Brak treści - np. tylko załącznik)```", inline=False)
+
+    embed.set_footer(text=f"ID Wiadomości (usuniętej): (Bot nie ma dostępu do ID po usunięciu przez siebie)") # message.id nie jest dostępne po message.delete()
+    # Można by przekazać message.id do log_moderation_action PRZED message.delete(), jeśli potrzebne.
+
+    try:
+        await log_channel.send(embed=embed)
+    except discord.Forbidden:
+        print(f"Błąd logowania moderacji: Brak uprawnień do wysyłania wiadomości na kanale logów {log_channel.mention} na serwerze {guild.name}.")
+    except Exception as e:
+        print(f"Nieoczekiwany błąd podczas logowania akcji moderacyjnej: {e}")
 
 
 @bot.tree.command(name="set_verified_role", description="Ustawia rolę nadawaną po pomyślnej weryfikacji quizem.")

@@ -50,16 +50,28 @@ def init_db():
         answer TEXT NOT NULL
     )
     """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS banned_words (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        word TEXT NOT NULL,
+        UNIQUE (guild_id, word)
+    )
+    """)
     conn.commit()
     conn.close()
 
 if __name__ == '__main__':
     init_db()
-    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs' i 'quiz_questions'.")
+    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs', 'quiz_questions' i 'banned_words'.")
 
 def update_server_config(guild_id: int, welcome_message_content: str = None,
                          reaction_role_id: int = None, reaction_message_id: int = None,
-                         unverified_role_id: int = None, verified_role_id: int = None):
+                         unverified_role_id: int = None, verified_role_id: int = None,
+                         moderation_log_channel_id: int = None,
+                         filter_profanity_enabled: bool = None,
+                         filter_spam_enabled: bool = None,
+                         filter_invites_enabled: bool = None):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     # Ensure the server_configs row exists
@@ -83,6 +95,18 @@ def update_server_config(guild_id: int, welcome_message_content: str = None,
     if verified_role_id is not None:
         updates.append("verified_role_id = ?")
         params.append(verified_role_id)
+    if moderation_log_channel_id is not None:
+        updates.append("moderation_log_channel_id = ?")
+        params.append(moderation_log_channel_id)
+    if filter_profanity_enabled is not None:
+        updates.append("filter_profanity_enabled = ?")
+        params.append(filter_profanity_enabled)
+    if filter_spam_enabled is not None:
+        updates.append("filter_spam_enabled = ?")
+        params.append(filter_spam_enabled)
+    if filter_invites_enabled is not None:
+        updates.append("filter_invites_enabled = ?")
+        params.append(filter_invites_enabled)
 
     if updates:
         sql = f"UPDATE server_configs SET {', '.join(updates)} WHERE guild_id = ?"
@@ -95,12 +119,11 @@ def update_server_config(guild_id: int, welcome_message_content: str = None,
 def get_server_config(guild_id: int):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # Ensure all columns are selected, even if they were added later to an existing DB
-    # This requires knowing all columns. A better way might be PRAGMA table_info and dynamic select
-    # For now, let's list them assuming they might be NULL
     cursor.execute("""
         SELECT welcome_message_content, reaction_role_id, reaction_message_id,
-               unverified_role_id, verified_role_id
+               unverified_role_id, verified_role_id,
+               moderation_log_channel_id, filter_profanity_enabled,
+               filter_spam_enabled, filter_invites_enabled
         FROM server_configs
         WHERE guild_id = ?
         """, (guild_id,))
@@ -112,9 +135,55 @@ def get_server_config(guild_id: int):
             "reaction_role_id": row[1],
             "reaction_message_id": row[2],
             "unverified_role_id": row[3],
-            "verified_role_id": row[4]
+            "verified_role_id": row[4],
+            "moderation_log_channel_id": row[5],
+            # SQLite przechowuje BOOLEAN jako INTEGER 0 lub 1
+            "filter_profanity_enabled": bool(row[6]) if row[6] is not None else True, # Domyślnie True
+            "filter_spam_enabled": bool(row[7]) if row[7] is not None else True,       # Domyślnie True
+            "filter_invites_enabled": bool(row[8]) if row[8] is not None else True   # Domyślnie True
         }
+    # Zwróć domyślną konfigurację, jeśli wiersz nie istnieje, ale upewnij się, że guild_id jest tam
+    # Lepiej jest, gdy `update_server_config` tworzy wiersz, a ta funkcja zwraca None, jeśli go nie ma
+    # lub podstawowe wartości domyślne, jeśli jest, ale niektóre pola są None.
+    # Dla spójności, jeśli INSERT OR IGNORE w update_server_config tworzy wiersz, to pola będą NULL.
+    # Tutaj nadajemy im wartości domyślne, jeśli są NULL w bazie.
+    # Jeśli serwer nie ma w ogóle wpisu, zwracamy None.
     return None
+
+
+# --- Funkcje dla Czarnej Listy Słów (Moderacja) ---
+
+def add_banned_word(guild_id: int, word: str) -> bool:
+    """Dodaje słowo do czarnej listy. Zwraca True jeśli dodano, False jeśli już istnieje."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO banned_words (guild_id, word) VALUES (?, ?)", (guild_id, word.lower()))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError: # Słowo już istnieje dla tego guild_id
+        return False
+    finally:
+        conn.close()
+
+def remove_banned_word(guild_id: int, word: str) -> bool:
+    """Usuwa słowo z czarnej listy. Zwraca True jeśli usunięto, False jeśli nie znaleziono."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM banned_words WHERE guild_id = ? AND word = ?", (guild_id, word.lower()))
+    deleted_rows = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return deleted_rows > 0
+
+def get_banned_words(guild_id: int) -> list[str]:
+    """Pobiera listę zakazanych słów dla danego serwera."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT word FROM banned_words WHERE guild_id = ?", (guild_id,))
+    words = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return words
 
 # --- Funkcje dla Quizu Weryfikacyjnego ---
 
