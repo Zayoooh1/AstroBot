@@ -237,6 +237,31 @@ def get_expired_active_punishments(current_timestamp: int) -> list[dict]:
     conn.close()
     return expired
 
+def get_user_punishments(guild_id: int, user_id: int) -> list[dict]:
+    """Pobiera wszystkie przypadki moderacyjne dla danego użytkownika na serwerze, posortowane od najnowszego."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT id, moderator_id, type, reason, expires_at, active, created_at
+    FROM punishments
+    WHERE guild_id = ? AND user_id = ?
+    ORDER BY created_at DESC
+    """, (guild_id, user_id))
+
+    cases = []
+    for row in cursor.fetchall():
+        cases.append({
+            "id": row[0],
+            "moderator_id": row[1],
+            "type": row[2],
+            "reason": row[3],
+            "expires_at": row[4],
+            "active": bool(row[5]),
+            "created_at": row[6]
+        })
+    conn.close()
+    return cases
+
 
 # --- Funkcje dla Czarnej Listy Słów (Moderacja) ---
 
