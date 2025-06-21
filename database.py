@@ -237,8 +237,10 @@ def update_server_config(guild_id: int, welcome_message_content: str = None,
                          custom_command_prefix: str = None,
                          ticket_category_id: int = None,
                          ticket_log_channel_id: int = None,
-                         ticket_support_role_ids_json: str = None, # Przechowujemy jako JSON string
-                         feedback_channel_id: int = None
+                         ticket_support_role_ids_json: str = None,
+                         feedback_channel_id: int = None,
+                         product_report_channel_id: int = None,
+                         product_report_time_utc: str = None # Format "HH:MM"
                          ):
     import json # Potrzebne do serializacji/deserializacji listy ID ról
     conn = sqlite3.connect(DB_NAME)
@@ -269,6 +271,8 @@ def update_server_config(guild_id: int, welcome_message_content: str = None,
     add_update("ticket_log_channel_id", ticket_log_channel_id)
     add_update("ticket_support_role_ids_json", ticket_support_role_ids_json)
     add_update("feedback_channel_id", feedback_channel_id)
+    add_update("product_report_channel_id", product_report_channel_id)
+    add_update("product_report_time_utc", product_report_time_utc)
 
     if updates:
         sql = f"UPDATE server_configs SET {', '.join(updates)} WHERE guild_id = ?"
@@ -292,7 +296,8 @@ def get_server_config(guild_id: int):
         "muted_role_id": None, "moderator_actions_log_channel_id": None,
         "custom_command_prefix": "!",
         "ticket_category_id": None, "ticket_log_channel_id": None, "ticket_support_role_ids_json": "[]",
-        "feedback_channel_id": None # Domyślnie None
+        "feedback_channel_id": None,
+        "product_report_channel_id": None, "product_report_time_utc": None # Domyślnie None
     }
 
     select_cols_str = ", ".join([key for key in all_config_keys if key in available_columns])
@@ -710,6 +715,150 @@ def get_user_rank_in_server(guild_id: int, user_id: int) -> tuple[int, int] | No
     except ValueError:
         conn.close()
         return None
+
+# --- Funkcje dla Raportów Produktowych ---
+
+def get_all_guilds_with_product_report_config() -> list[dict]:
+    """Pobiera listę ID serwerów i ich konfiguracji raportów produktowych."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    # Upewniamy się, że kolumny istnieją, zanim ich zażądamy
+    cursor.execute("PRAGMA table_info(server_configs)")
+    columns = [row[1] for row in cursor.fetchall()]
+
+    required_cols = ["guild_id", "product_report_channel_id", "product_report_time_utc"]
+    if not all(col in columns for col in required_cols):
+        # Jeśli którejś z kluczowych kolumn brakuje, nie możemy kontynuować dla tej funkcji
+        print("Ostrzeżenie: Brak wymaganych kolumn w server_configs dla raportów produktowych (product_report_channel_id, product_report_time_utc).")
+        conn.close()
+        return []
+
+    cursor.execute("""
+    SELECT guild_id, product_report_channel_id, product_report_time_utc
+    FROM server_configs
+    WHERE product_report_channel_id IS NOT NULL AND product_report_time_utc IS NOT NULL
+    """)
+    configs = [
+        {"guild_id": row[0], "report_channel_id": row[1], "report_time_utc": row[2]}
+        for row in cursor.fetchall()
+    ]
+    conn.close()
+    return configs
+
+def get_product_changes_for_report(guild_id: int, hours_ago: int = 24) -> list[dict]:
+    """
+    Pobiera produkty, których cena lub dostępność zmieniła się w ciągu ostatnich X godzin.
+    Zwraca listę słowników, każdy z 'product_url', 'product_name',
+    'old_price_str', 'new_price_str', 'old_availability_str', 'new_availability_str'.
+    To jest uproszczone, wymagałoby bardziej zaawansowanego śledzenia historii.
+    Na razie zaimplementujemy prostszą wersję: produkty, które były skanowane
+    w ciągu ostatnich X godzin i których obecna cena/dostępność różni się od poprzedniej historycznej.
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    timestamp_limit = int(time.time()) - (hours_ago * 3600)
+
+    # To zapytanie jest dość skomplikowane i może wymagać optymalizacji lub innego podejścia
+    # dla dużych zbiorów danych. Na razie jest to koncepcja.
+    # Znajdź produkty, które miały zmianę ceny lub dostępności porównując ostatnie dwa wpisy w historii
+    # lub ostatni wpis z obecnym stanem, jeśli ostatni wpis jest wystarczająco stary.
+    # Uproszczenie: weźmy wszystkie produkty i ich ostatnie dwa wpisy w historii (jeśli istnieją)
+    # i porównajmy je w kodzie Pythona. To mniej wydajne dla bazy, ale łatwiejsze do napisania na szybko.
+
+    cursor.execute("""
+        SELECT
+            wp.id, wp.product_url, wp.product_name,
+            wp.last_known_price_str AS current_price,
+            wp.last_known_availability_str AS current_availability,
+            (SELECT ph.price_str FROM price_history ph
+             WHERE ph.watched_product_id = wp.id ORDER BY ph.scan_date DESC LIMIT 1 OFFSET 1) AS prev_price,
+            (SELECT ph.availability_str FROM price_history ph
+             WHERE ph.watched_product_id = wp.id ORDER BY ph.scan_date DESC LIMIT 1 OFFSET 1) AS prev_availability,
+            (SELECT ph.scan_date FROM price_history ph
+             WHERE ph.watched_product_id = wp.id ORDER BY ph.scan_date DESC LIMIT 1 OFFSET 0) AS last_scan_date_in_history
+        FROM watched_products wp
+        WHERE wp.guild_id = ? AND wp.is_active = TRUE
+              AND wp.last_scanned_at >= ?
+              AND (wp.last_known_price_str IS NOT NULL OR wp.last_known_availability_str IS NOT NULL)
+    """, (guild_id, timestamp_limit))
+
+    changes = []
+    for row in cursor.fetchall():
+        product_id, url, name, curr_price, curr_avail, prev_price, prev_avail, last_hist_scan = row
+
+        # Jeśli nie ma poprzedniego wpisu w historii, bierzemy tylko te, które mają co najmniej dwa skany.
+        # Lub jeśli chcemy porównać z pierwszym skanem, to inna logika.
+        # Na razie, jeśli prev_price/prev_avail jest None, to znaczy, że to może być nowy produkt lub tylko jeden skan.
+
+        changed = False
+        if curr_price != prev_price and prev_price is not None : # Sprawdzamy None, bo może nie być poprzedniego wpisu
+            changed = True
+        if curr_avail != prev_avail and prev_avail is not None :
+            changed = True
+
+        if changed:
+            changes.append({
+                "product_url": url, "product_name": name or "Nieznana nazwa",
+                "old_price_str": prev_price, "new_price_str": curr_price,
+                "old_availability_str": prev_avail, "new_availability_str": curr_avail,
+                "last_scan_date_in_history": last_hist_scan # Data ostatniego wpisu w historii (tego "nowego")
+            })
+
+    conn.close()
+    return changes
+
+
+def get_top_price_drops(guild_id: int, hours_ago: int = 24, limit: int = 5) -> list[dict]:
+    """
+    Pobiera top X produktów z największym spadkiem ceny (procentowym lub kwotowym).
+    To również jest uproszczone i wymagałoby dokładniejszej analizy historii.
+    Na razie: znajdź produkty, których cena spadła w ostatnim skanowaniu w porównaniu do przedostatniego.
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    timestamp_limit = int(time.time()) - (hours_ago * 3600)
+
+    # To zapytanie jest koncepcyjne. Wymagałoby przechowywania cen jako liczb do łatwego porównania.
+    # Ponieważ ceny są stringami, porównanie i obliczenie różnicy w SQL jest trudne.
+    # Zrobimy to w Pythonie po pobraniu danych.
+
+    # Pobierz produkty, które miały co najmniej dwa wpisy w historii w ciągu ostatnich X godzin
+    # i których obecna cena jest niższa niż poprzednia.
+    # To jest bardzo nieefektywne. Lepsze byłoby obliczenie różnicy w Pythonie
+    # po pobraniu wszystkich produktów ze zmianami.
+
+    # Uproszczona wersja: pobierz wszystkie produkty ze zmianami i przefiltruj w Pythonie.
+    all_changes = get_product_changes_for_report(guild_id, hours_ago)
+
+    price_drops = []
+    for change in all_changes:
+        if change["new_price_str"] and change["old_price_str"]:
+            try:
+                # Konwersja stringów cen na float. Zakłada, że ceny są w formacie "1234.56"
+                # Należy dodać bardziej robustne parsowanie cen, jeśli formaty są różne.
+                new_price = float(change["new_price_str"].replace(',', '.')) # Upewnij się, że kropka jest separatorem dziesiętnym
+                old_price = float(change["old_price_str"].replace(',', '.'))
+
+                if new_price < old_price:
+                    drop_amount = old_price - new_price
+                    drop_percentage = (drop_amount / old_price) * 100 if old_price > 0 else 0
+                    price_drops.append({
+                        "product_url": change["product_url"],
+                        "product_name": change["product_name"],
+                        "old_price_str": change["old_price_str"],
+                        "new_price_str": change["new_price_str"],
+                        "drop_amount_str": f"{drop_amount:.2f}", # Sformatowane
+                        "drop_percentage": drop_percentage
+                    })
+            except ValueError: # Błąd konwersji ceny na float
+                print(f"Błąd konwersji ceny dla produktu {change['product_url']}: old='{change['old_price_str']}', new='{change['new_price_str']}'")
+                continue # Pomiń ten produkt
+
+    # Sortuj po procentowym spadku (lub kwotowym)
+    price_drops.sort(key=lambda x: x["drop_percentage"], reverse=True)
+
+    return price_drops[:limit]
+
 
 # --- Funkcje dla Monitorowania Produktów (Product Watchlist) ---
 
