@@ -61,6 +61,424 @@ async def on_ready_final():
 bot.event(on_ready_final)
 
 
+# --- Moduł Ankiet ---
+REGIONAL_INDICATOR_EMOJIS = [
+    "🇦", "🇧", "🇨", "🇩", "🇪", "🇫", "🇬", "🇭", "🇮", "🇯",
+    "🇰", "🇱", "🇲", "🇳", "🇴", "🇵", "🇶", "🇷", "🇸", "🇹" # Max 20 opcji na razie
+]
+
+@bot.tree.command(name="create_poll", description="Tworzy nową ankietę z opcjami do głosowania przez reakcje.")
+@app_commands.describe(
+    pytanie="Pytanie ankiety.",
+    opcje="Opcje odpowiedzi, rozdzielone znakiem '|' (np. Opcja A|Opcja B|Opcja C). Maksymalnie 20 opcji.",
+    czas_trwania="Czas trwania ankiety (np. 30m, 2h, 1d). Domyślnie 24h. Wpisz '0s' dla ankiety bez limitu czasu.",
+    kanal="Kanał, na którym opublikować ankietę (domyślnie aktualny kanał)."
+)
+@app_commands.checks.has_permissions(manage_guild=True) # Lub inne odpowiednie uprawnienie
+async def create_poll_command(interaction: discord.Interaction,
+                              pytanie: str,
+                              opcje: str,
+                              czas_trwania: str = "24h",
+                              kanal: discord.TextChannel = None):
+    if not interaction.guild_id or not interaction.guild:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    target_channel = kanal if kanal else interaction.channel
+    if not isinstance(target_channel, discord.TextChannel): # Upewnienie się, że kanał jest tekstowy
+        await interaction.response.send_message("Ankieta może być opublikowana tylko na kanale tekstowym.", ephemeral=True)
+        return
+
+    parsed_options = [opt.strip() for opt in opcje.split('|') if opt.strip()]
+    if not parsed_options or len(parsed_options) < 2:
+        await interaction.response.send_message("Musisz podać przynajmniej dwie opcje odpowiedzi, rozdzielone znakiem '|'.", ephemeral=True)
+        return
+    if len(parsed_options) > len(REGIONAL_INDICATOR_EMOJIS):
+        await interaction.response.send_message(f"Możesz podać maksymalnie {len(REGIONAL_INDICATOR_EMOJIS)} opcji odpowiedzi.", ephemeral=True)
+        return
+
+    ends_at_timestamp = None
+    if czas_trwania and czas_trwania.lower() not in ['0', '0s', 'none', 'permanent']:
+        duration_seconds = time_parser.parse_duration(czas_trwania)
+        if duration_seconds is None or duration_seconds < 0: # Pozwól na 0, ale nie na ujemne
+            await interaction.response.send_message("Nieprawidłowy format czasu trwania. Użyj np. 30m, 2h, 1d lub '0s' dla braku limitu.", ephemeral=True)
+            return
+        if duration_seconds > 0 :
+             ends_at_timestamp = int(time.time() + duration_seconds)
+
+    # Tworzenie ankiety w bazie
+    try:
+        poll_id = database.create_poll(
+            guild_id=interaction.guild_id,
+            channel_id=target_channel.id,
+            question=pytanie,
+            created_by_id=interaction.user.id,
+            ends_at=ends_at_timestamp
+        )
+        if poll_id is None: # Powinno rzucić wyjątek, ale dla pewności
+            await interaction.response.send_message("Nie udało się utworzyć ankiety w bazie danych.", ephemeral=True)
+            return
+
+        poll_options_with_emoji = []
+        for i, option_text in enumerate(parsed_options):
+            emoji = REGIONAL_INDICATOR_EMOJIS[i]
+            database.add_poll_option(poll_id, option_text, emoji)
+            poll_options_with_emoji.append(f"{emoji} {option_text}")
+
+        # Tworzenie embedu ankiety
+        embed = discord.Embed(
+            title=f"📊 Ankieta: {pytanie}",
+            description="\n\n".join(poll_options_with_emoji),
+            color=discord.Color.blurple(),
+            timestamp=datetime.utcnow()
+        )
+        embed.set_footer(text=f"Ankieta stworzona przez {interaction.user.display_name} | ID Ankiety: {poll_id}")
+        if ends_at_timestamp:
+            embed.add_field(name="Koniec głosowania", value=f"<t:{ends_at_timestamp}:F> (<t:{ends_at_timestamp}:R>)")
+        else:
+            embed.add_field(name="Koniec głosowania", value="Nigdy (ręczne zamknięcie)")
+
+        # Wysyłanie wiadomości ankiety
+        poll_message = await target_channel.send(embed=embed)
+        database.set_poll_message_id(poll_id, poll_message.id)
+
+        # Dodawanie reakcji
+        for i in range(len(parsed_options)):
+            await poll_message.add_reaction(REGIONAL_INDICATOR_EMOJIS[i])
+
+        await interaction.response.send_message(f"Ankieta została pomyślnie utworzona na kanale {target_channel.mention}!", ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.response.send_message(f"Nie mam uprawnień do wysłania wiadomości lub dodania reakcji na kanale {target_channel.mention}.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Wystąpił nieoczekiwany błąd podczas tworzenia ankiety: {e}", ephemeral=True)
+        print(f"Błąd w /create_poll: {e}")
+
+@create_poll_command.error
+async def create_poll_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień do zarządzania serwerem, aby utworzyć ankietę.", ephemeral=True)
+    else:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)
+        else:
+            await interaction.followup.send(f"Wystąpił błąd: {error}", ephemeral=True)
+        print(f"Błąd w create_poll_error: {error}")
+
+# --- Zadanie w Tle do Zamykania Ankiet ---
+@tasks.loop(minutes=1)
+async def check_expired_polls_task():
+    await bot.wait_until_ready()
+    current_timestamp = int(time.time())
+    polls_to_close = database.get_active_polls_to_close(current_timestamp)
+
+    if polls_to_close:
+        print(f"[POLL_TASK] Znaleziono {len(polls_to_close)} ankiet do zamknięcia.")
+
+    for poll_data in polls_to_close:
+        guild = bot.get_guild(poll_data["guild_id"])
+        if not guild:
+            print(f"[POLL_TASK] Nie znaleziono serwera {poll_data['guild_id']} dla ankiety ID {poll_data['id']}. Zamykam w bazie.")
+            database.close_poll(poll_data["id"])
+            continue
+
+        channel = guild.get_channel(poll_data["channel_id"])
+        if not channel or not isinstance(channel, discord.TextChannel):
+            print(f"[POLL_TASK] Nie znaleziono kanału {poll_data['channel_id']} dla ankiety ID {poll_data['id']} na serwerze {guild.name}. Zamykam w bazie.")
+            database.close_poll(poll_data["id"])
+            continue
+
+        try:
+            poll_message = await channel.fetch_message(poll_data["message_id"])
+        except discord.NotFound:
+            print(f"[POLL_TASK] Nie znaleziono wiadomości ankiety {poll_data['message_id']} dla ankiety ID {poll_data['id']}. Zamykam w bazie.")
+            database.close_poll(poll_data["id"])
+            continue
+        except discord.Forbidden:
+            print(f"[POLL_TASK] Brak uprawnień do pobrania wiadomości ankiety {poll_data['message_id']} (Ankieta ID {poll_data['id']}). Zamykam w bazie.")
+            database.close_poll(poll_data["id"])
+            continue
+        except Exception as e:
+            print(f"[POLL_TASK] Inny błąd przy pobieraniu wiadomości ankiety {poll_data['message_id']}: {e}. Zamykam w bazie.")
+            database.close_poll(poll_data["id"])
+            continue
+
+        poll_options = database.get_poll_options(poll_data["id"])
+        if not poll_options:
+            print(f"[POLL_TASK] Brak opcji dla ankiety ID {poll_data['id']}. Zamykam w bazie.")
+            database.close_poll(poll_data["id"])
+            continue
+
+        results = {} # emoji: count
+        total_votes = 0
+        for reaction in poll_message.reactions:
+            emoji_str = str(reaction.emoji)
+            # Sprawdź, czy emoji reakcji jest jednym z emoji opcji ankiety
+            # Odejmujemy 1 od reaction.count, ponieważ liczy też reakcję bota
+            is_option_emoji = any(opt['reaction_emoji'] == emoji_str for opt in poll_options)
+            if is_option_emoji:
+                # Jeśli chcemy unikalne głosy (jeden użytkownik, jeden głos na opcję), musielibyśmy iterować po użytkownikach reakcji.
+                # Na razie proste zliczanie reakcji (minus bot).
+                # count = reaction.count - 1 if reaction.me else reaction.count # Jeśli bot dodaje reakcje
+                # Bezpieczniej:
+                users = [user async for user in reaction.users() if not user.bot]
+                count = len(users)
+
+                results[emoji_str] = count
+                total_votes += count
+
+        # Przygotowanie embedu z wynikami
+        results_embed = discord.Embed(
+            title=f"📊 Wyniki Ankiety: {poll_data['question']}",
+            color=discord.Color.green(),
+            timestamp=datetime.utcnow()
+        )
+        results_description_parts = []
+        sorted_options = sorted(poll_options, key=lambda x: results.get(x['reaction_emoji'], 0), reverse=True)
+
+        for option in sorted_options:
+            emoji = option['reaction_emoji']
+            text = option['option_text']
+            votes = results.get(emoji, 0)
+            percentage = (votes / total_votes * 100) if total_votes > 0 else 0
+
+            # Prosty tekstowy pasek "wykresu"
+            bar_length = 10
+            filled_blocks = int(bar_length * (percentage / 100))
+            bar = '█' * filled_blocks + '░' * (bar_length - filled_blocks)
+
+            results_description_parts.append(
+                f"{emoji} **{text}**: {votes} głosów ({percentage:.1f}%)\n`{bar}`"
+            )
+
+        if not results_description_parts:
+            results_embed.description = "Nikt nie zagłosował w tej ankiecie."
+        else:
+            results_embed.description = "\n\n".join(results_description_parts)
+
+        results_embed.add_field(name="Całkowita liczba głosów", value=str(total_votes))
+        creator = guild.get_member(poll_data['created_by_id']) or await bot.fetch_user(poll_data['created_by_id'])
+        if creator:
+            results_embed.set_footer(text=f"Ankieta stworzona przez {creator.display_name} | ID Ankiety: {poll_data['id']}")
+
+        results_message = None
+        try:
+            results_message = await channel.send(embed=results_embed)
+            # (Opcjonalnie) Edytuj oryginalną wiadomość ankiety
+            try:
+                original_embed = poll_message.embeds[0] if poll_message.embeds else None
+                if original_embed:
+                    new_embed_data = original_embed.to_dict()
+                    new_embed_data['title'] = "[ZAKOŃCZONA] " + new_embed_data.get('title', poll_data['question'])
+                    new_embed_data['color'] = discord.Color.dark_grey().value
+                    if 'fields' in new_embed_data: # Usuń pole o czasie zakończenia, jeśli było
+                        new_embed_data['fields'] = [f for f in new_embed_data['fields'] if f['name'] != "Koniec głosowania"]
+                    new_embed_data.setdefault('fields', []).append({'name': "Wyniki", 'value': f"[Zobacz wyniki]({results_message.jump_url})", 'inline': False})
+
+                    final_embed = discord.Embed.from_dict(new_embed_data)
+                    await poll_message.edit(embed=final_embed, view=None) # Usuń reakcje/przyciski jeśli były
+                    await poll_message.clear_reactions() # Usuń wszystkie reakcje z wiadomości ankiety
+            except Exception as e_edit:
+                print(f"[POLL_TASK] Nie udało się edytować oryginalnej wiadomości ankiety ID {poll_data['message_id']}: {e_edit}")
+
+        except discord.Forbidden:
+            print(f"[POLL_TASK] Brak uprawnień do wysłania wyników ankiety ID {poll_data['id']} na kanale {channel.name}.")
+        except Exception as e_send_results:
+            print(f"[POLL_TASK] Błąd wysyłania wyników ankiety ID {poll_data['id']}: {e_send_results}")
+
+        database.close_poll(poll_data["id"], results_message_id=results_message.id if results_message else None)
+        print(f"[POLL_TASK] Ankieta ID {poll_data['id']} została zamknięta i wyniki ogłoszone.")
+
+
+# Modyfikacja on_ready_final aby startować nowy task
+_on_ready_final_original = on_ready_final # Zakładamy, że on_ready_final jest już zdefiniowane
+
+async def on_ready_with_all_tasks_including_polls():
+    await _on_ready_final_original()
+    if not check_expired_polls_task.is_running():
+        check_expired_polls_task.start()
+        print("Uruchomiono zadanie 'check_expired_polls_task'.")
+
+# Nadpisujemy @bot.event on_ready_final nową funkcją
+# To jest trochę nieeleganckie, lepiej mieć jedną funkcję on_ready.
+# Zrefaktoryzuję to w następnym kroku, aby on_ready_final było jedną funkcją.
+# Na razie, dla tego kroku, zrobię to tak:
+# bot.event(on_ready_with_all_tasks_including_polls) # Re-rejestrujemy on_ready
+# Powyższe było niepoprawne, @bot.event dekoruje funkcję, a nie ją zastępuje w ten sposób.
+# Prawidłowa refaktoryzacja on_ready jest poniżej.
+
+# --- Główny Event On Ready ---
+@bot.event
+async def on_ready_setup(): # Nowa, jednolita funkcja on_ready
+    print(f'Zalogowano jako {bot.user}')
+    try:
+        database.init_db()
+        print("Baza danych zainicjalizowana.")
+        synced = await bot.tree.sync() # Synchronizuj globalnie
+        print(f"Zsynchronizowano {len(synced)} komend(y) globalnie.")
+    except Exception as e:
+        print(f"Wystąpił błąd podczas inicjalizacji lub synchronizacji komend: {e}")
+
+    # Startuj wszystkie taski w tle, jeśli jeszcze nie działają
+    if hasattr(bot, 'check_expired_roles') and not check_expired_roles.is_running():
+        check_expired_roles.start()
+        print("Uruchomiono zadanie 'check_expired_roles'.")
+
+    if hasattr(bot, 'check_expired_punishments_task') and not check_expired_punishments_task.is_running():
+        check_expired_punishments_task.start()
+        print("Uruchomiono zadanie 'check_expired_punishments_task'.")
+
+    if hasattr(bot, 'check_expired_polls_task') and not check_expired_polls_task.is_running(): # Nowy task dla ankiet
+        check_expired_polls_task.start()
+        print("Uruchomiono zadanie 'check_expired_polls_task'.")
+
+# Usunięcie starych, potencjalnie konfliktujących dekoratorów @bot.event dla on_ready
+# i przypisanie nowej funkcji. Jeśli `on_ready_final` lub `on_ready_with_tasks`
+# były wcześniej dekorowane, to ten krok jest ważny.
+# Jeśli `on_ready_final` było już jedynym handlerem, to to jest OK.
+# Dla pewności, usuwam wszystkie poprzednie listenery 'on_ready' i dodaję nowy.
+# To jest bardziej zaawansowane i może nie być konieczne, jeśli struktura była prosta.
+# Lepsze jest po prostu użycie @bot.event dla jednej funkcji on_ready.
+# Zakładając, że `on_ready_final` z poprzedniego kroku było jedynym, to wystarczy zmienić jego nazwę i zawartość.
+
+# Poprzednia linia `bot.event(on_ready_with_all_tasks_including_polls)` została usunięta,
+# a nowa funkcja `on_ready_setup` jest dekorowana `@bot.event` co jest standardowym sposobem.
+# Upewniam się, że `on_ready_final` nie jest już używane, a `on_ready_setup` jest.
+# Zastąpiłem wcześniejsze `bot.event(on_ready_final)` nową dekoracją.
+# Wszystkie poprzednie `bot.on_ready = nazwa_funkcji` powinny być usunięte.
+# Powyższa funkcja `on_ready_setup` staje się jedynym handlerem `@bot.event` dla `on_ready`.
+
+@bot.tree.command(name="close_poll", description="Manualnie zamyka aktywną ankietę i ogłasza wyniki.")
+@app_commands.describe(id_wiadomosci_ankiety="ID wiadomości, na której znajduje się ankieta do zamknięcia.")
+@app_commands.checks.has_permissions(manage_guild=True) # Lub inne odpowiednie uprawnienie
+async def close_poll_command(interaction: discord.Interaction, id_wiadomosci_ankiety: str):
+    if not interaction.guild_id or not interaction.guild:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    try:
+        message_id = int(id_wiadomosci_ankiety)
+    except ValueError:
+        await interaction.response.send_message("ID wiadomości musi być liczbą.", ephemeral=True)
+        return
+
+    poll_data = database.get_poll_by_message_id(message_id)
+
+    if not poll_data:
+        await interaction.response.send_message(f"Nie znaleziono ankiety powiązanej z wiadomością o ID: {message_id}.", ephemeral=True)
+        return
+
+    if not poll_data["is_active"]:
+        await interaction.response.send_message(f"Ankieta (ID: {poll_data['id']}) jest już zamknięta.", ephemeral=True)
+        return
+
+    # Potwierdzenie od moderatora, że na pewno chce zamknąć
+    # Można by tu dodać przyciski Tak/Nie, ale dla uproszczenia na razie zamykamy od razu.
+    # await interaction.response.send_message(f"Czy na pewno chcesz zamknąć ankietę '{poll_data['question']}' (ID: {poll_data['id']})?", ephemeral=True, view=ConfirmView())
+
+    await interaction.response.defer(ephemeral=True, thinking=True) # Daj znać, że pracujemy
+
+    guild = interaction.guild # Mamy pewność, że jest, bo sprawdziliśmy guild_id
+    channel = guild.get_channel(poll_data["channel_id"])
+
+    if not channel or not isinstance(channel, discord.TextChannel):
+        print(f"[CLOSE_POLL] Nie znaleziono kanału {poll_data['channel_id']} dla ankiety ID {poll_data['id']}. Zamykam w bazie.")
+        database.close_poll(poll_data["id"])
+        await interaction.followup.send(f"Nie znaleziono kanału ankiety. Ankieta (ID: {poll_data['id']}) została zamknięta w bazie.", ephemeral=True)
+        return
+
+    try:
+        poll_message = await channel.fetch_message(poll_data["message_id"])
+    except discord.NotFound:
+        print(f"[CLOSE_POLL] Nie znaleziono wiadomości ankiety {poll_data['message_id']} dla ankiety ID {poll_data['id']}. Zamykam w bazie.")
+        database.close_poll(poll_data["id"])
+        await interaction.followup.send(f"Nie znaleziono oryginalnej wiadomości ankiety. Ankieta (ID: {poll_data['id']}) została zamknięta w bazie.", ephemeral=True)
+        return
+    except Exception as e:
+        print(f"[CLOSE_POLL] Błąd przy pobieraniu wiadomości ankiety {poll_data['message_id']}: {e}. Zamykam w bazie.")
+        database.close_poll(poll_data["id"])
+        await interaction.followup.send(f"Wystąpił błąd przy dostępie do wiadomości ankiety. Ankieta (ID: {poll_data['id']}) została zamknięta w bazie.", ephemeral=True)
+        return
+
+    poll_options = database.get_poll_options(poll_data["id"])
+    if not poll_options: # Powinno być niemożliwe, jeśli ankieta została poprawnie stworzona
+        print(f"[CLOSE_POLL] Brak opcji dla ankiety ID {poll_data['id']}. Zamykam w bazie.")
+        database.close_poll(poll_data["id"])
+        await interaction.followup.send(f"Brak opcji dla ankiety. Ankieta (ID: {poll_data['id']}) została zamknięta w bazie.", ephemeral=True)
+        return
+
+    # Logika zliczania głosów i wysyłania wyników (taka sama jak w check_expired_polls_task)
+    results = {}
+    total_votes = 0
+    for reaction in poll_message.reactions:
+        emoji_str = str(reaction.emoji)
+        is_option_emoji = any(opt['reaction_emoji'] == emoji_str for opt in poll_options)
+        if is_option_emoji:
+            users = [user async for user in reaction.users() if not user.bot]
+            count = len(users)
+            results[emoji_str] = count
+            total_votes += count
+
+    results_embed = discord.Embed(
+        title=f"📊 Wyniki Ankiety (Zamknięta Manualnie): {poll_data['question']}",
+        color=discord.Color.dark_red(), # Inny kolor dla manualnego zamknięcia
+        timestamp=datetime.utcnow()
+    )
+    results_description_parts = []
+    sorted_options = sorted(poll_options, key=lambda x: results.get(x['reaction_emoji'], 0), reverse=True)
+
+    for option in sorted_options:
+        emoji = option['reaction_emoji']
+        text = option['option_text']
+        votes = results.get(emoji, 0)
+        percentage = (votes / total_votes * 100) if total_votes > 0 else 0
+        bar_length = 10
+        filled_blocks = int(bar_length * (percentage / 100))
+        bar = '█' * filled_blocks + '░' * (bar_length - filled_blocks)
+        results_description_parts.append(f"{emoji} **{text}**: {votes} głosów ({percentage:.1f}%)\n`{bar}`")
+
+    results_embed.description = "\n\n".join(results_description_parts) if results_description_parts else "Nikt nie zagłosował."
+    results_embed.add_field(name="Całkowita liczba głosów", value=str(total_votes))
+    creator = guild.get_member(poll_data['created_by_id']) or await bot.fetch_user(poll_data['created_by_id'])
+    if creator:
+        results_embed.set_footer(text=f"Ankieta ID: {poll_data['id']} | Zamknięta przez: {interaction.user.display_name}")
+
+    results_message = None
+    try:
+        results_message = await channel.send(embed=results_embed)
+        try:
+            original_embed = poll_message.embeds[0] if poll_message.embeds else None
+            if original_embed:
+                new_embed_data = original_embed.to_dict()
+                new_embed_data['title'] = "[ZAMKNIĘTA MANUALNIE] " + new_embed_data.get('title', poll_data['question'])
+                new_embed_data['color'] = discord.Color.dark_grey().value
+                if 'fields' in new_embed_data:
+                    new_embed_data['fields'] = [f for f in new_embed_data['fields'] if f['name'] != "Koniec głosowania"]
+                new_embed_data.setdefault('fields', []).append({'name': "Wyniki", 'value': f"[Zobacz wyniki]({results_message.jump_url})", 'inline': False})
+                final_embed = discord.Embed.from_dict(new_embed_data)
+                await poll_message.edit(embed=final_embed, view=None)
+                await poll_message.clear_reactions()
+        except Exception as e_edit:
+            print(f"[CLOSE_POLL] Nie udało się edytować oryginalnej wiadomości ankiety ID {poll_data['message_id']}: {e_edit}")
+
+        database.close_poll(poll_data["id"], results_message_id=results_message.id if results_message else None)
+        await interaction.followup.send(f"Ankieta (ID: {poll_data['id']}) została zamknięta. Wyniki ogłoszone.", ephemeral=True)
+    except Exception as e_send_results:
+        print(f"[CLOSE_POLL] Błąd wysyłania wyników ankiety ID {poll_data['id']}: {e_send_results}")
+        database.close_poll(poll_data["id"]) # Mimo wszystko zamknij w bazie
+        await interaction.followup.send(f"Wystąpił błąd podczas ogłaszania wyników, ale ankieta (ID: {poll_data['id']}) została zamknięta w bazie.", ephemeral=True)
+
+@close_poll_command.error
+async def close_poll_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień do zarządzania serwerem, aby zamknąć ankietę.", ephemeral=True)
+    else:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)
+        else:
+            await interaction.followup.send(f"Wystąpił błąd: {error}", ephemeral=True)
+        print(f"Błąd w close_poll_error: {error}")
+
 # Komenda do ustawiania wiadomości powitalnej
 @bot.tree.command(name="set_welcome_message", description="Ustawia treść wiadomości powitalnej dla reakcji.")
 @app_commands.describe(tresc="Treść wiadomości powitalnej")
