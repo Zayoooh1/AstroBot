@@ -158,12 +158,29 @@ def init_db():
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_custom_commands_guild_name ON custom_commands (guild_id, command_name)")
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS tickets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        channel_id INTEGER UNIQUE,
+        user_id INTEGER NOT NULL,
+        topic TEXT,
+        created_at INTEGER NOT NULL,
+        is_open BOOLEAN DEFAULT TRUE,
+        closed_by_id INTEGER,
+        closed_at INTEGER
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tickets_guild_user_open ON tickets (guild_id, user_id, is_open)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tickets_channel_id ON tickets (channel_id)")
+
+
     conn.commit()
     conn.close()
 
 if __name__ == '__main__':
     init_db()
-    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs', 'quiz_questions', 'banned_words', 'punishments', 'level_rewards', 'polls', 'poll_options', 'giveaways' i 'custom_commands'.")
+    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs', 'quiz_questions', 'banned_words', 'punishments', 'level_rewards', 'polls', 'poll_options', 'giveaways', 'custom_commands' i 'tickets'.") # Dodano custom_commands i tickets
 
 def update_server_config(guild_id: int, welcome_message_content: str = None,
                          reaction_role_id: int = None, reaction_message_id: int = None,
@@ -174,8 +191,12 @@ def update_server_config(guild_id: int, welcome_message_content: str = None,
                          filter_invites_enabled: bool = None,
                          muted_role_id: int = None,
                          moderator_actions_log_channel_id: int = None,
-                         custom_command_prefix: str = None
+                         custom_command_prefix: str = None,
+                         ticket_category_id: int = None,
+                         ticket_log_channel_id: int = None,
+                         ticket_support_role_ids_json: str = None # Przechowujemy jako JSON string
                          ):
+    import json # Potrzebne do serializacji/deserializacji listy ID ról
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("INSERT OR IGNORE INTO server_configs (guild_id) VALUES (?)", (guild_id,))
@@ -200,6 +221,9 @@ def update_server_config(guild_id: int, welcome_message_content: str = None,
     add_update("muted_role_id", muted_role_id)
     add_update("moderator_actions_log_channel_id", moderator_actions_log_channel_id)
     add_update("custom_command_prefix", custom_command_prefix)
+    add_update("ticket_category_id", ticket_category_id)
+    add_update("ticket_log_channel_id", ticket_log_channel_id)
+    add_update("ticket_support_role_ids_json", ticket_support_role_ids_json)
 
     if updates:
         sql = f"UPDATE server_configs SET {', '.join(updates)} WHERE guild_id = ?"
@@ -221,7 +245,8 @@ def get_server_config(guild_id: int):
         "moderation_log_channel_id": None,
         "filter_profanity_enabled": True, "filter_spam_enabled": True, "filter_invites_enabled": True,
         "muted_role_id": None, "moderator_actions_log_channel_id": None,
-        "custom_command_prefix": "!" # Domyślny prefix
+        "custom_command_prefix": "!",
+        "ticket_category_id": None, "ticket_log_channel_id": None, "ticket_support_role_ids_json": "[]" # Pusta lista JSON jako default
     }
 
     select_cols_str = ", ".join([key for key in all_config_keys if key in available_columns])
@@ -831,6 +856,71 @@ def create_giveaway(guild_id: int, channel_id: int, prize: str, winner_count: in
     conn.commit()
     conn.close()
     return giveaway_id
+
+# --- Funkcje dla Ticketów ---
+def create_ticket(guild_id: int, user_id: int, topic: str | None) -> int:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    created_at_ts = int(time.time())
+    cursor.execute("""
+    INSERT INTO tickets (guild_id, user_id, topic, created_at, is_open)
+    VALUES (?, ?, ?, ?, TRUE)
+    """, (guild_id, user_id, topic, created_at_ts))
+    ticket_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return ticket_id
+
+def set_ticket_channel_id(ticket_id: int, channel_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE tickets SET channel_id = ? WHERE id = ?", (channel_id, ticket_id))
+    conn.commit()
+    conn.close()
+
+def get_open_ticket_by_user(guild_id: int, user_id: int) -> dict | None:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT id, channel_id, topic, created_at
+    FROM tickets
+    WHERE guild_id = ? AND user_id = ? AND is_open = TRUE
+    """, (guild_id, user_id))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {"id": row[0], "channel_id": row[1], "topic": row[2], "created_at": row[3]}
+    return None
+
+def get_ticket_by_channel(guild_id: int, channel_id: int) -> dict | None:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT id, user_id, topic, created_at, is_open, closed_by_id, closed_at
+    FROM tickets
+    WHERE guild_id = ? AND channel_id = ?
+    """, (guild_id, channel_id))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {
+            "id": row[0], "user_id": row[1], "topic": row[2], "created_at": row[3],
+            "is_open": bool(row[4]), "closed_by_id": row[5], "closed_at": row[6]
+        }
+    return None
+
+def close_ticket(ticket_id: int, closed_by_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    closed_at_ts = int(time.time())
+    cursor.execute("""
+    UPDATE tickets
+    SET is_open = FALSE, closed_by_id = ?, closed_at = ?
+    WHERE id = ?
+    """, (closed_by_id, closed_at_ts, ticket_id))
+    conn.commit()
+    conn.close()
+
 
 def set_giveaway_message_id(giveaway_id: int, message_id: int):
     conn = sqlite3.connect(DB_NAME)
