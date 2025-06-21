@@ -70,14 +70,12 @@ def scrape_xkom_product(url: str) -> dict | None:
 
 
         # Jeśli kluczowe dane nie zostały znalezione, możemy uznać scrapowanie za nieudane
-        if not product_data["name"] or not product_data["price_str"]:
-            print(f"Scraping X-Kom: Nie udało się znaleźć nazwy lub ceny dla {url}")
-            # Można dodać bardziej szczegółowe logowanie, które elementy nie zostały znalezione.
+        if not product_data["name"] or product_data.get("price_in_cents") is None: # Sprawdzamy price_in_cents
+            print(f"Scraping X-Kom: Nie udało się znaleźć nazwy lub ceny (price_in_cents) dla {url}")
             # Zwrócenie częściowych danych, jeśli są, lub None, jeśli nic kluczowego nie ma.
-            if product_data["name"] or product_data["price_str"] or product_data["availability_str"]:
+            if product_data["name"] or product_data.get("price_in_cents") is not None or product_data["availability_str"]:
                  return product_data # Zwróć to co masz
             return None
-
 
         return product_data
 
@@ -86,6 +84,19 @@ def scrape_xkom_product(url: str) -> dict | None:
         return None
     except Exception as e:
         print(f"Nieoczekiwany błąd podczas scrapowania {url}: {e}")
+        return None
+
+def _parse_price_to_cents(price_text: str) -> int | None:
+    """Konwertuje string ceny (np. "1 234,56 zł") na liczbę całkowitą groszy."""
+    if not price_text:
+        return None
+    try:
+        # Usuń "zł", spacje (w tym non-breaking space \xa0), zamień przecinek na kropkę
+        cleaned_price = price_text.lower().replace('zł', '').replace('\xa0', '').replace(' ', '').replace(',', '.')
+        price_float = float(cleaned_price)
+        return int(price_float * 100)
+    except ValueError:
+        print(f"Nie udało się sparsować ceny '{price_text}' na grosze.")
         return None
 
 if __name__ == '__main__':
@@ -97,7 +108,10 @@ if __name__ == '__main__':
     data = scrape_xkom_product(test_url)
     if data:
         print(f"Nazwa: {data.get('name')}")
-        print(f"Cena: {data.get('price_str')}")
+        price_cents = data.get('price_in_cents')
+        print(f"Cena (grosze): {price_cents}")
+        if price_cents is not None:
+            print(f"Cena (zł): {price_cents / 100:.2f} zł")
         print(f"Dostępność: {data.get('availability_str')}")
     else:
         print("Nie udało się pobrać danych.")
@@ -107,7 +121,10 @@ if __name__ == '__main__':
     data_niedostepny = scrape_xkom_product(test_url_niedostepny)
     if data_niedostepny:
         print(f"Nazwa: {data_niedostepny.get('name')}")
-        print(f"Cena: {data_niedostepny.get('price_str')}")
+        price_cents_n = data_niedostepny.get('price_in_cents')
+        print(f"Cena (grosze): {price_cents_n}")
+        if price_cents_n is not None:
+             print(f"Cena (zł): {price_cents_n / 100:.2f} zł")
         print(f"Dostępność: {data_niedostepny.get('availability_str')}")
     else:
         print("Nie udało się pobrać danych dla produktu niedostępnego.")
