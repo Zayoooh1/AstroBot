@@ -27,6 +27,8 @@ def init_db():
         guild_id INTEGER NOT NULL,
         user_id INTEGER NOT NULL,
         message_count INTEGER DEFAULT 0,
+        xp INTEGER DEFAULT 0,
+        level INTEGER DEFAULT 0,
         PRIMARY KEY (guild_id, user_id)
     )
     """)
@@ -113,27 +115,85 @@ def get_active_timed_role(guild_id: int, user_id: int, role_id: int):
         return {"id": row[0], "expiration_timestamp": row[1]}
     return None
 
-# --- Funkcje dla Ról za Aktywność ---
+# --- Funkcje dla Aktywności Użytkownika (Wiadomości, XP, Poziomy) ---
 
-def increment_message_count(guild_id: int, user_id: int):
+def ensure_user_activity_entry(guild_id: int, user_id: int):
+    """Upewnia się, że wpis dla użytkownika istnieje, tworząc go jeśli nie."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("""
-    INSERT INTO user_activity (guild_id, user_id, message_count)
-    VALUES (?, ?, 1)
-    ON CONFLICT(guild_id, user_id) DO UPDATE SET message_count = message_count + 1
+    INSERT OR IGNORE INTO user_activity (guild_id, user_id, message_count, xp, level)
+    VALUES (?, ?, 0, 0, 0)
     """, (guild_id, user_id))
     conn.commit()
     conn.close()
 
-def get_message_count(guild_id: int, user_id: int) -> int:
+def increment_message_count(guild_id: int, user_id: int):
+    ensure_user_activity_entry(guild_id, user_id)
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT message_count FROM user_activity WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+    cursor.execute("""
+    UPDATE user_activity
+    SET message_count = message_count + 1
+    WHERE guild_id = ? AND user_id = ?
+    """, (guild_id, user_id))
+    conn.commit()
+    conn.close()
+
+def add_xp(guild_id: int, user_id: int, xp_amount: int) -> int:
+    ensure_user_activity_entry(guild_id, user_id)
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    UPDATE user_activity
+    SET xp = xp + ?
+    WHERE guild_id = ? AND user_id = ?
+    """, (xp_amount, guild_id, user_id))
+    conn.commit()
+
+    cursor.execute("SELECT xp FROM user_activity WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+    new_total_xp = cursor.fetchone()[0]
+    conn.close()
+    return new_total_xp
+
+def get_user_stats(guild_id: int, user_id: int) -> dict:
+    ensure_user_activity_entry(guild_id, user_id) # Upewnij się, że użytkownik ma wpis
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT message_count, xp, level FROM user_activity WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
     row = cursor.fetchone()
     conn.close()
-    return row[0] if row else 0
+    if row:
+        return {"message_count": row[0], "xp": row[1], "level": row[2]}
+    return {"message_count": 0, "xp": 0, "level": 0} # Powinno być utworzone przez ensure
 
+def set_user_level(guild_id: int, user_id: int, new_level: int):
+    ensure_user_activity_entry(guild_id, user_id)
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    UPDATE user_activity
+    SET level = ?
+    WHERE guild_id = ? AND user_id = ?
+    """, (new_level, guild_id, user_id))
+    conn.commit()
+    conn.close()
+
+# (Opcjonalnie) Funkcja do jednoczesnego ustawiania poziomu i XP, jeśli potrzebna później
+# def set_user_level_xp(guild_id: int, user_id: int, new_level: int, new_xp: int):
+#     ensure_user_activity_entry(guild_id, user_id)
+#     conn = sqlite3.connect(DB_NAME)
+#     cursor = conn.cursor()
+#     cursor.execute("""
+#     UPDATE user_activity
+#     SET level = ?, xp = ?
+#     WHERE guild_id = ? AND user_id = ?
+#     """, (new_level, new_xp, guild_id, user_id))
+#     conn.commit()
+#     conn.close()
+
+
+# --- Funkcje dla Konfiguracji Ról za Aktywność (pozostają bez zmian) ---
 def add_activity_role_config(guild_id: int, role_id: int, required_message_count: int):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
