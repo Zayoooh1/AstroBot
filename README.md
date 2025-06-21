@@ -166,7 +166,7 @@ Ten projekt jest udostępniany na licencji **MIT**. Szczegóły znajdują się w
 ```
 MIT License
 
-Copyright (c) [Rok] [Twoje Imię/Nazwa Organizacji]
+Copyright (c) 2025 ZayoDev
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
