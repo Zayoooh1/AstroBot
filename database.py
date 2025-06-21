@@ -174,13 +174,27 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_tickets_guild_user_open ON tickets (guild_id, user_id, is_open)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_tickets_channel_id ON tickets (channel_id)")
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS tracked_creators (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        platform TEXT NOT NULL CHECK(platform IN ('twitch', 'youtube')),
+        creator_identifier TEXT NOT NULL, -- Nazwa kanału Twitch, ID kanału YouTube
+        discord_channel_id INTEGER NOT NULL,
+        custom_notification_message TEXT,
+        last_notified_id TEXT,            -- ID ostatniego streama/video
+        last_checked_at INTEGER,
+        UNIQUE (guild_id, platform, creator_identifier, discord_channel_id)
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracked_creators_guild_platform ON tracked_creators (guild_id, platform)")
 
     conn.commit()
     conn.close()
 
 if __name__ == '__main__':
     init_db()
-    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs', 'quiz_questions', 'banned_words', 'punishments', 'level_rewards', 'polls', 'poll_options', 'giveaways', 'custom_commands' i 'tickets'.") # Dodano custom_commands i tickets
+    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs', 'quiz_questions', 'banned_words', 'punishments', 'level_rewards', 'polls', 'poll_options', 'giveaways', 'custom_commands', 'tickets' i 'tracked_creators'.")
 
 def update_server_config(guild_id: int, welcome_message_content: str = None,
                          reaction_role_id: int = None, reaction_message_id: int = None,
