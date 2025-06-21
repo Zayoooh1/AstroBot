@@ -189,12 +189,41 @@ def init_db():
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracked_creators_guild_platform ON tracked_creators (guild_id, platform)")
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS watched_products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER, -- Może być NULL jeśli produkt jest globalny dla bota, lub ID serwera jeśli per-serwer
+        user_id_who_added INTEGER NOT NULL,
+        product_url TEXT NOT NULL UNIQUE,
+        shop_name TEXT NOT NULL,
+        product_name TEXT,
+        last_known_price_str TEXT,
+        last_known_availability_str TEXT,
+        last_scanned_at INTEGER,
+        is_active BOOLEAN DEFAULT TRUE
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_watched_products_url ON watched_products (product_url)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_watched_products_active_shop ON watched_products (is_active, shop_name)")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS price_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        watched_product_id INTEGER NOT NULL,
+        scan_date INTEGER NOT NULL,
+        price_str TEXT,
+        availability_str TEXT,
+        FOREIGN KEY(watched_product_id) REFERENCES watched_products(id) ON DELETE CASCADE
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_history_product_date ON price_history (watched_product_id, scan_date DESC)")
+
     conn.commit()
     conn.close()
 
 if __name__ == '__main__':
     init_db()
-    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs', 'quiz_questions', 'banned_words', 'punishments', 'level_rewards', 'polls', 'poll_options', 'giveaways', 'custom_commands', 'tickets' i 'tracked_creators'.")
+    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs', 'quiz_questions', 'banned_words', 'punishments', 'level_rewards', 'polls', 'poll_options', 'giveaways', 'custom_commands', 'tickets', 'tracked_creators', 'watched_products' i 'price_history'.")
 
 def update_server_config(guild_id: int, welcome_message_content: str = None,
                          reaction_role_id: int = None, reaction_message_id: int = None,
@@ -681,6 +710,144 @@ def get_user_rank_in_server(guild_id: int, user_id: int) -> tuple[int, int] | No
     except ValueError:
         conn.close()
         return None
+
+# --- Funkcje dla Monitorowania Produktów (Product Watchlist) ---
+
+def add_watched_product(user_id: int, url: str, shop_name: str, guild_id: int = None) -> int | None:
+    """Dodaje nowy produkt do śledzenia. Zwraca ID produktu lub None jeśli już istnieje."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+        INSERT INTO watched_products (guild_id, user_id_who_added, product_url, shop_name, last_scanned_at)
+        VALUES (?, ?, ?, ?, ?)
+        """, (guild_id, user_id, url, shop_name.lower(), int(time.time())))
+        product_id = cursor.lastrowid
+        conn.commit()
+        return product_id
+    except sqlite3.IntegrityError: # product_url jest UNIQUE
+        conn.rollback()
+        # Można by tu pobrać ID istniejącego produktu, jeśli to potrzebne
+        cursor.execute("SELECT id FROM watched_products WHERE product_url = ?", (url,))
+        existing = cursor.fetchone()
+        if existing: return existing[0] # Zwróć ID istniejącego, jeśli go znaleziono
+        return None
+    finally:
+        conn.close()
+
+def get_watched_product_by_url(url: str) -> dict | None:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT id, guild_id, user_id_who_added, shop_name, product_name,
+           last_known_price_str, last_known_availability_str, last_scanned_at, is_active
+    FROM watched_products WHERE product_url = ?
+    """, (url,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {
+            "id": row[0], "guild_id": row[1], "user_id_who_added": row[2], "shop_name": row[3],
+            "product_name": row[4], "last_known_price_str": row[5],
+            "last_known_availability_str": row[6], "last_scanned_at": row[7], "is_active": bool(row[8])
+        }
+    return None
+
+def get_all_active_watched_products() -> list[dict]:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT id, guild_id, user_id_who_added, product_url, shop_name, product_name,
+           last_known_price_str, last_known_availability_str, last_scanned_at
+    FROM watched_products
+    WHERE is_active = TRUE
+    """)
+    products = [
+        {
+            "id": row[0], "guild_id": row[1], "user_id_who_added": row[2], "product_url": row[3],
+            "shop_name": row[4], "product_name": row[5], "last_known_price_str": row[6],
+            "last_known_availability_str": row[7], "last_scanned_at": row[8]
+        } for row in cursor.fetchall()
+    ]
+    conn.close()
+    return products
+
+def update_watched_product_data(product_id: int, name: str | None, price_str: str | None,
+                                availability_str: str | None, scanned_at: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    updates = []
+    params = []
+    if name is not None: updates.append("product_name = ?"); params.append(name)
+    if price_str is not None: updates.append("last_known_price_str = ?"); params.append(price_str)
+    if availability_str is not None: updates.append("last_known_availability_str = ?"); params.append(availability_str)
+    updates.append("last_scanned_at = ?"); params.append(scanned_at)
+
+    if updates: # Powinno zawsze być, bo scanned_at jest wymagane
+        sql = f"UPDATE watched_products SET {', '.join(updates)} WHERE id = ?"
+        params.append(product_id)
+        cursor.execute(sql, tuple(params))
+        conn.commit()
+    conn.close()
+
+def add_price_history_entry(watched_product_id: int, scan_date: int, price_str: str | None, availability_str: str | None):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO price_history (watched_product_id, scan_date, price_str, availability_str)
+    VALUES (?, ?, ?, ?)
+    """, (watched_product_id, scan_date, price_str, availability_str))
+    conn.commit()
+    conn.close()
+
+def get_product_price_history(watched_product_id: int, limit: int = 10) -> list[dict]:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT scan_date, price_str, availability_str
+    FROM price_history
+    WHERE watched_product_id = ?
+    ORDER BY scan_date DESC
+    LIMIT ?
+    """, (watched_product_id, limit))
+    history = [
+        {"scan_date": row[0], "price_str": row[1], "availability_str": row[2]}
+        for row in cursor.fetchall()
+    ]
+    conn.close()
+    return history
+
+def deactivate_watched_product(product_id: int) -> bool:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE watched_products SET is_active = FALSE WHERE id = ?", (product_id,))
+    updated_rows = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return updated_rows > 0
+
+def get_user_watched_products(user_id: int, guild_id: int | None = None) -> list[dict]:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    sql = """
+    SELECT id, product_url, shop_name, product_name, last_known_price_str, last_known_availability_str
+    FROM watched_products
+    WHERE user_id_who_added = ? AND is_active = TRUE
+    """
+    params = [user_id]
+    if guild_id is not None: # Jeśli chcemy filtrować po serwerze
+        sql += " AND guild_id = ?"
+        params.append(guild_id)
+
+    cursor.execute(sql, tuple(params))
+    products = [
+        {
+            "id": row[0], "product_url": row[1], "shop_name": row[2], "product_name": row[3],
+            "last_known_price_str": row[4], "last_known_availability_str": row[5]
+        } for row in cursor.fetchall()
+    ]
+    conn.close()
+    return products
 
 # --- Funkcje dla Ankiet (Polls) ---
 def create_poll(guild_id: int, channel_id: int, question: str, created_by_id: int, ends_at: int | None = None) -> int:
