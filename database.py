@@ -74,12 +74,26 @@ def init_db():
     # Indeksy dla częstych zapytań
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_punishments_user_guild ON punishments (user_id, guild_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_punishments_expires_active ON punishments (expires_at, active)")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS level_rewards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        level INTEGER NOT NULL,
+        role_id_to_grant INTEGER,
+        custom_message_on_level_up TEXT,
+        UNIQUE (guild_id, level, role_id_to_grant)
+    )
+    """)
+    # Indeks dla szybkiego wyszukiwania nagród dla poziomu
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_level_rewards_guild_level ON level_rewards (guild_id, level)")
+
     conn.commit()
     conn.close()
 
 if __name__ == '__main__':
     init_db()
-    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs', 'quiz_questions', 'banned_words' i 'punishments'.")
+    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs', 'quiz_questions', 'banned_words', 'punishments' i 'level_rewards'.")
 
 def update_server_config(guild_id: int, welcome_message_content: str = None,
                          reaction_role_id: int = None, reaction_message_id: int = None,
@@ -264,6 +278,124 @@ def get_user_punishments(guild_id: int, user_id: int) -> list[dict]:
 
 
 # --- Funkcje dla Czarnej Listy Słów (Moderacja) ---
+
+# --- Funkcje dla Nagród za Poziomy (Level Rewards) ---
+
+def add_level_reward(guild_id: int, level: int, role_id: int = None, message: str = None) -> int | None:
+    """Dodaje nagrodę za poziom. Przynajmniej rola lub wiadomość musi być podana."""
+    if role_id is None and message is None:
+        return None # Nie można dodać pustej nagrody
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+        INSERT INTO level_rewards (guild_id, level, role_id_to_grant, custom_message_on_level_up)
+        VALUES (?, ?, ?, ?)
+        """, (guild_id, level, role_id, message))
+        reward_id = cursor.lastrowid
+        conn.commit()
+        return reward_id
+    except sqlite3.IntegrityError: # Naruszenie UNIQUE constraint
+        conn.rollback()
+        return None # Lub rzucić specyficzny błąd, np. RewardAlreadyExistsError
+    finally:
+        conn.close()
+
+def remove_level_reward(reward_id: int) -> bool:
+    """Usuwa nagrodę za poziom po jej ID. Zwraca True jeśli usunięto."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM level_rewards WHERE id = ?", (reward_id,))
+    deleted_rows = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return deleted_rows > 0
+
+def get_rewards_for_level(guild_id: int, level: int) -> list[dict]:
+    """Pobiera wszystkie nagrody skonfigurowane dla danego poziomu na serwerze."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT id, role_id_to_grant, custom_message_on_level_up
+    FROM level_rewards
+    WHERE guild_id = ? AND level = ?
+    """, (guild_id, level))
+    rewards = [
+        {"id": row[0], "role_id_to_grant": row[1], "custom_message_on_level_up": row[2]}
+        for row in cursor.fetchall()
+    ]
+    conn.close()
+    return rewards
+
+def get_all_level_rewards_config(guild_id: int) -> list[dict]:
+    """Pobiera wszystkie skonfigurowane nagrody za poziomy dla serwera, posortowane po poziomie."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT id, level, role_id_to_grant, custom_message_on_level_up
+    FROM level_rewards
+    WHERE guild_id = ?
+    ORDER BY level ASC
+    """, (guild_id,))
+    configs = [
+        {"id": row[0], "level": row[1], "role_id_to_grant": row[2], "custom_message_on_level_up": row[3]}
+        for row in cursor.fetchall()
+    ]
+    conn.close()
+    return configs
+
+# --- Funkcje dla Rankingu ---
+
+def get_server_leaderboard(guild_id: int, limit: int = 10, offset: int = 0) -> list[dict]:
+    """Pobiera listę użytkowników do leaderboardu, posortowaną po XP."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT user_id, xp, level
+    FROM user_activity
+    WHERE guild_id = ? AND xp > 0 -- Tylko użytkownicy z jakimkolwiek XP
+    ORDER BY xp DESC, level DESC
+    LIMIT ? OFFSET ?
+    """, (guild_id, limit, offset))
+    leaderboard = [
+        {"user_id": row[0], "xp": row[1], "level": row[2]}
+        for row in cursor.fetchall()
+    ]
+    conn.close()
+    return leaderboard
+
+def get_user_rank_in_server(guild_id: int, user_id: int) -> tuple[int, int] | None:
+    """Zwraca pozycję użytkownika w rankingu serwera i całkowitą liczbę graczy w rankingu.
+       Zwraca None, jeśli użytkownik nie ma XP."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    # Najpierw sprawdź, czy użytkownik ma jakiekolwiek XP
+    cursor.execute("SELECT xp FROM user_activity WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+    user_xp_row = cursor.fetchone()
+    if not user_xp_row or user_xp_row[0] == 0:
+        conn.close()
+        return None # Użytkownik nie jest w rankingu
+
+    # Pobierz wszystkich użytkowników z XP > 0, posortowanych
+    cursor.execute("""
+    SELECT user_id FROM user_activity
+    WHERE guild_id = ? AND xp > 0
+    ORDER BY xp DESC, level DESC, user_id ASC -- user_id dla stabilnego sortowania przy remisach XP/level
+    """, (guild_id,))
+
+    ranked_users = [row[0] for row in cursor.fetchall()]
+    total_ranked_players = len(ranked_users)
+
+    try:
+        rank = ranked_users.index(user_id) + 1
+        conn.close()
+        return rank, total_ranked_players
+    except ValueError: # Użytkownik nie znaleziony na liście (nie powinien się zdarzyć, jeśli ma XP)
+        conn.close()
+        return None
+
 
 def add_banned_word(guild_id: int, word: str) -> bool:
     """Dodaje słowo do czarnej listy. Zwraca True jeśli dodano, False jeśli już istnieje."""
