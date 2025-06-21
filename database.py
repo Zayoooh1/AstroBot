@@ -194,7 +194,8 @@ def update_server_config(guild_id: int, welcome_message_content: str = None,
                          custom_command_prefix: str = None,
                          ticket_category_id: int = None,
                          ticket_log_channel_id: int = None,
-                         ticket_support_role_ids_json: str = None # Przechowujemy jako JSON string
+                         ticket_support_role_ids_json: str = None, # Przechowujemy jako JSON string
+                         feedback_channel_id: int = None
                          ):
     import json # Potrzebne do serializacji/deserializacji listy ID ról
     conn = sqlite3.connect(DB_NAME)
@@ -224,6 +225,7 @@ def update_server_config(guild_id: int, welcome_message_content: str = None,
     add_update("ticket_category_id", ticket_category_id)
     add_update("ticket_log_channel_id", ticket_log_channel_id)
     add_update("ticket_support_role_ids_json", ticket_support_role_ids_json)
+    add_update("feedback_channel_id", feedback_channel_id)
 
     if updates:
         sql = f"UPDATE server_configs SET {', '.join(updates)} WHERE guild_id = ?"
@@ -246,7 +248,8 @@ def get_server_config(guild_id: int):
         "filter_profanity_enabled": True, "filter_spam_enabled": True, "filter_invites_enabled": True,
         "muted_role_id": None, "moderator_actions_log_channel_id": None,
         "custom_command_prefix": "!",
-        "ticket_category_id": None, "ticket_log_channel_id": None, "ticket_support_role_ids_json": "[]" # Pusta lista JSON jako default
+        "ticket_category_id": None, "ticket_log_channel_id": None, "ticket_support_role_ids_json": "[]",
+        "feedback_channel_id": None # Domyślnie None
     }
 
     select_cols_str = ", ".join([key for key in all_config_keys if key in available_columns])
