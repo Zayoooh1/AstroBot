@@ -4,9 +4,16 @@ from discord.ext import commands # Możemy użyć Bot zamiast Client dla lepszej
 import os
 from dotenv import load_dotenv
 import database # Import naszego modułu bazy danych
+import leveling # Import modułu systemu poziomowania
+import random # Do losowania XP
+import time # Do cooldownu XP i timestampów
 
 load_dotenv()
 TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+
+# Globalny słownik do śledzenia cooldownu XP dla użytkowników
+# Klucz: (guild_id, user_id), Wartość: timestamp ostatniego przyznania XP
+last_xp_gain_timestamp = {}
 
 # Definiujemy intencje, w tym guilds i members, które mogą być potrzebne
 intents = discord.Intents.default()
@@ -672,4 +679,115 @@ async def on_message(message: discord.Message):
     # musisz wywołać bot.process_commands(message) na końcu tego eventu,
     # aby bot mógł je przetworzyć. Jeśli używasz tylko komend slash, to nie jest konieczne.
     # Jeśli `on_message` jest zdefiniowany, to blokuje automatyczne wywoływanie komend tekstowych.
-    # await bot.process_commands(message) # Odkomentuj, jeśli używasz komend tekstowych z prefixem
+
+    # --- Logika XP i Poziomów ---
+    # Upewnij się, że importujesz 'leveling' i 'random' na górze pliku main.py
+    # import leveling
+    # import random
+    # last_xp_gain_timestamp = {} # Przenieś to na poziom globalny modułu main.py, jeśli jeszcze nie istnieje
+
+    if message.guild and not message.author.bot: # Sprawdzenie, czy wiadomość jest z serwera i nie od bota
+        guild_id = message.guild.id
+        user_id = message.author.id
+        current_time = time.time()
+
+        # Cooldown dla XP
+        user_cooldown_key = (guild_id, user_id)
+        last_gain = last_xp_gain_timestamp.get(user_cooldown_key, 0)
+
+        if current_time - last_gain > leveling.XP_COOLDOWN_SECONDS:
+            xp_to_add = random.randint(leveling.XP_PER_MESSAGE_MIN, leveling.XP_PER_MESSAGE_MAX)
+            new_total_xp = database.add_xp(guild_id, user_id, xp_to_add)
+            last_xp_gain_timestamp[user_cooldown_key] = current_time
+
+            # print(f"User {message.author.name} gained {xp_to_add} XP. Total XP: {new_total_xp}") # Logowanie przyznania XP
+
+            user_stats = database.get_user_stats(guild_id, user_id)
+            current_level_db = user_stats['level']
+
+            calculated_level = leveling.get_level_from_xp(new_total_xp)
+
+            if calculated_level > current_level_db:
+                database.set_user_level(guild_id, user_id, calculated_level)
+                try:
+                    # Wysłanie wiadomości o awansie na kanale, gdzie padła ostatnia wiadomość
+                    # Można to też wysłać w PW lub na dedykowany kanał
+                    await message.channel.send(
+                        f"🎉 Gratulacje {message.author.mention}! Osiągnąłeś/aś **Poziom {calculated_level}**!"
+                    )
+                    print(f"User {message.author.name} leveled up to {calculated_level} on server {message.guild.name}.")
+                except discord.Forbidden:
+                    print(f"Nie udało się wysłać wiadomości o awansie na kanale {message.channel.name} (brak uprawnień).")
+                except Exception as e:
+                    print(f"Nieoczekiwany błąd podczas wysyłania wiadomości o awansie: {e}")
+
+    # Jeśli używasz komend tekstowych z prefixem, odkomentuj poniższe:
+    # await bot.process_commands(message)
+
+# Komenda /rank
+@bot.tree.command(name="rank", description="Wyświetla Twój aktualny poziom i postęp XP (lub innego użytkownika).")
+@app_commands.describe(uzytkownik="Użytkownik, którego statystyki chcesz zobaczyć (opcjonalnie).")
+async def rank_command(interaction: discord.Interaction, uzytkownik: discord.Member = None):
+    if not interaction.guild_id:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    target_user = uzytkownik if uzytkownik else interaction.user
+
+    # Upewnij się, że target_user to Member, a nie User, jeśli pochodzi z interaction.user
+    if not isinstance(target_user, discord.Member):
+        target_user = interaction.guild.get_member(target_user.id)
+        if not target_user:
+            await interaction.response.send_message("Nie udało się znaleźć tego użytkownika na serwerze.", ephemeral=True)
+            return
+
+
+    user_stats = database.get_user_stats(interaction.guild_id, target_user.id)
+    current_level = user_stats['level']
+    current_xp = user_stats['xp']
+
+    xp_for_current_level_gate = leveling.total_xp_for_level(current_level)
+    xp_for_next_level_gate = leveling.total_xp_for_level(current_level + 1)
+
+    xp_in_current_level = current_xp - xp_for_current_level_gate
+    xp_needed_for_next_level_up = xp_for_next_level_gate - xp_for_current_level_gate
+
+    # Zapobieganie dzieleniu przez zero, jeśli xp_for_level_up(current_level + 1) zwróci 0 (np. max level)
+    # lub jeśli current_level = 0 i xp_for_next_level_gate jest progiem dla level 1
+    if xp_needed_for_next_level_up == 0 and current_level > 0 : # Osiągnięto jakiś maksymalny skonfigurowany poziom
+        progress_percentage = 100.0
+        progress_bar = "█" * 10 # Pełny pasek
+        xp_display = f"{current_xp} XP (MAX POZIOM)"
+    elif xp_needed_for_next_level_up == 0 and current_level == 0: # Poziom 0, próg do poziomu 1 to xp_for_next_level_gate
+        if xp_for_next_level_gate == 0: # Sytuacja awaryjna, nie powinno się zdarzyć przy dobrej formule
+             progress_percentage = 0.0
+        else:
+            progress_percentage = (current_xp / xp_for_next_level_gate) * 100
+        progress_bar_filled_count = int(progress_percentage / 10)
+        progress_bar = "█" * progress_bar_filled_count + "░" * (10 - progress_bar_filled_count)
+        xp_display = f"{current_xp} / {xp_for_next_level_gate} XP"
+
+    else:
+        progress_percentage = (xp_in_current_level / xp_needed_for_next_level_up) * 100
+        progress_bar_filled_count = int(progress_percentage / 10)
+        progress_bar = "█" * progress_bar_filled_count + "░" * (10 - progress_bar_filled_count)
+        xp_display = f"{xp_in_current_level} / {xp_needed_for_next_level_up} XP na tym poziomie"
+
+
+    embed = discord.Embed(
+        title=f"Statystyki Aktywności dla {target_user.display_name}",
+        color=discord.Color.green() if target_user == interaction.user else discord.Color.blue()
+    )
+    embed.set_thumbnail(url=target_user.display_avatar.url)
+    embed.add_field(name="Poziom", value=f"**{current_level}**", inline=True)
+    embed.add_field(name="Całkowite XP", value=f"**{current_xp}**", inline=True)
+
+    embed.add_field(
+        name=f"Postęp do Poziomu {current_level + 1}",
+        value=f"{progress_bar} ({progress_percentage:.2f}%)\n{xp_display}",
+        inline=False
+    )
+    # Można dodać ranking globalny/serwerowy jeśli zaimplementowany
+    # embed.add_field(name="Ranking na serwerze", value="#X (TODO)", inline=True)
+
+    await interaction.response.send_message(embed=embed)
