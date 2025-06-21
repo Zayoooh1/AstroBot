@@ -1,5 +1,6 @@
 import sqlite3
 import time
+import json # Dodano import json
 
 DB_NAME = 'bot_config.db'
 
@@ -22,11 +23,6 @@ def init_db():
         moderator_actions_log_channel_id INTEGER
     )
     """)
-    # Dodawanie kolumn do server_configs jeśli nie istnieją (dla kompatybilności wstecznej)
-    # To jest bardziej skomplikowane w SQLite, więc funkcje get/update muszą sobie radzić z możliwym brakiem kolumn
-    # lub zakładamy, że przy pierwszym uruchomieniu z nową strukturą, tabela jest tworzona poprawnie.
-    # Lepszym podejściem byłby system migracji, ale to wykracza poza zakres.
-
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS timed_roles (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,12 +123,31 @@ def init_db():
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_poll_options_poll_id ON poll_options (poll_id)")
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS giveaways (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        channel_id INTEGER NOT NULL,
+        message_id INTEGER UNIQUE,
+        prize TEXT NOT NULL,
+        winner_count INTEGER DEFAULT 1,
+        created_by_id INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        ends_at INTEGER NOT NULL,
+        is_active BOOLEAN DEFAULT TRUE,
+        required_role_id INTEGER,
+        min_level INTEGER,
+        winners_json TEXT
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_giveaways_guild_active_ends ON giveaways (guild_id, is_active, ends_at)")
+
     conn.commit()
     conn.close()
 
 if __name__ == '__main__':
     init_db()
-    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs', 'quiz_questions', 'banned_words', 'punishments', 'level_rewards', 'polls' i 'poll_options'.")
+    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs', 'quiz_questions', 'banned_words', 'punishments', 'level_rewards', 'polls', 'poll_options' i 'giveaways'.")
 
 def update_server_config(guild_id: int, welcome_message_content: str = None,
                          reaction_role_id: int = None, reaction_message_id: int = None,
@@ -193,42 +208,29 @@ def get_server_config(guild_id: int):
     select_cols_str = ", ".join([key for key in all_config_keys if key in available_columns])
     if not select_cols_str:
         conn.close()
-        # Jeśli tabela server_configs jest zupełnie pusta (co nie powinno się zdarzyć po INSERT OR IGNORE)
-        # lub jeśli jakimś cudem nie ma żadnej z oczekiwanych kolumn, zwróć domyślne wartości.
-        # Jednak bardziej prawdopodobne jest, że select_cols_str będzie pusty, jeśli tabela nie istnieje,
-        # ale init_db() powinna ją stworzyć.
-        # Jeśli guild_id nie ma wpisu, to fetchone() zwróci None.
-        # Na wszelki wypadek, jeśli jakimś cudem nie ma kolumn, zwracamy domyślne.
-        # Ale to powinno być obsłużone przez fakt, że init_db tworzy kolumny.
-        # Jeśli `row_values` jest None, to znaczy, że nie ma wpisu dla guild_id.
-        # W takim przypadku, `update_server_config` z `INSERT OR IGNORE` powinno stworzyć wiersz przy pierwszej modyfikacji.
-        # A `get_server_config` powinno wtedy znaleźć ten wiersz (nawet jeśli z wartościami NULL).
-        # Jeśli `get_server_config` jest wywołane przed jakąkolwiek modyfikacją dla danego guild_id,
-        # i nie ma wiersza, zwrócenie `all_config_keys` (domyślnych) jest rozsądne.
-        # Jednakże, jeśli chcemy odróżnić brak konfiguracji od konfiguracji z wartościami domyślnymi,
-        # powinniśmy zwrócić None, jeśli wiersz nie istnieje.
-        # Zakładając, że `INSERT OR IGNORE` w `update_server_config` działa, wiersz zawsze będzie.
-        # Jeśli jest, ale wszystkie wartości są NULL, to `all_config_keys` zostaną zwrócone.
-        # Spróbujmy inaczej: jeśli nie ma wiersza, zwróć None.
         cursor.execute(f"SELECT guild_id FROM server_configs WHERE guild_id = ?", (guild_id,))
         if not cursor.fetchone():
             conn.close()
-            return None # Jawnie wskazujemy, że nie ma konfiguracji dla tego serwera
+            return None
+        # Jeśli wiersz istnieje, ale nie ma żadnych pasujących kolumn (bardzo mało prawdopodobne)
+        return all_config_keys
 
-    # Jeśli wiersz istnieje, kontynuuj z pobieraniem wartości
+
     cursor.execute(f"SELECT {select_cols_str} FROM server_configs WHERE guild_id = ?", (guild_id,))
-    row_values = cursor.fetchone() # To już powinno znaleźć wiersz
-    conn.close()
+    row_values = cursor.fetchone()
+
+    if not row_values: # Nie ma wpisu dla tego guild_id
+        conn.close()
+        return None
 
     config_result = all_config_keys.copy()
-
-    if row_values: # To powinno być zawsze prawdą, jeśli doszliśmy tutaj po sprawdzeniu powyżej
-        fetched_data = dict(zip([key for key in all_config_keys if key in available_columns], row_values))
-        for key, value in fetched_data.items():
-            if key in ["filter_profanity_enabled", "filter_spam_enabled", "filter_invites_enabled"]:
-                config_result[key] = bool(value) if value is not None else all_config_keys[key]
-            else:
-                config_result[key] = value if value is not None else all_config_keys[key]
+    fetched_data = dict(zip([key for key in all_config_keys if key in available_columns], row_values))
+    for key, value in fetched_data.items():
+        if key in ["filter_profanity_enabled", "filter_spam_enabled", "filter_invites_enabled"]:
+            config_result[key] = bool(value) if value is not None else all_config_keys[key]
+        else:
+            config_result[key] = value if value is not None else all_config_keys[key]
+    conn.close()
     return config_result
 
 
@@ -716,3 +718,79 @@ def get_poll_details(poll_id: int) -> dict | None:
     poll_data["options"] = get_poll_options(poll_id) # Pobierz opcje dla tej ankiety
     conn.close()
     return poll_data
+
+# --- Funkcje dla Konkursów (Giveaways) ---
+# import json # Już zaimportowany na górze
+
+def create_giveaway(guild_id: int, channel_id: int, prize: str, winner_count: int,
+                    created_by_id: int, ends_at: int,
+                    required_role_id: int | None = None, min_level: int | None = None) -> int:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    created_at_ts = int(time.time())
+    cursor.execute("""
+    INSERT INTO giveaways (guild_id, channel_id, prize, winner_count, created_by_id, created_at, ends_at,
+                           required_role_id, min_level, is_active, winners_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, NULL)
+    """, (guild_id, channel_id, prize, winner_count, created_by_id, created_at_ts, ends_at,
+          required_role_id, min_level))
+    giveaway_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return giveaway_id
+
+def set_giveaway_message_id(giveaway_id: int, message_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE giveaways SET message_id = ? WHERE id = ?", (message_id, giveaway_id))
+    conn.commit()
+    conn.close()
+
+def get_active_giveaways_to_end(current_timestamp: int) -> list[dict]:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT id, guild_id, channel_id, message_id, prize, winner_count, created_by_id, ends_at,
+           required_role_id, min_level
+    FROM giveaways
+    WHERE is_active = TRUE AND ends_at <= ?
+    """, (current_timestamp,))
+    giveaways = [
+        {
+            "id": row[0], "guild_id": row[1], "channel_id": row[2], "message_id": row[3],
+            "prize": row[4], "winner_count": row[5], "created_by_id": row[6], "ends_at": row[7],
+            "required_role_id": row[8], "min_level": row[9]
+        } for row in cursor.fetchall()
+    ]
+    conn.close()
+    return giveaways
+
+def end_giveaway(giveaway_id: int, winners_ids: list[int]):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    winners_json_str = json.dumps(winners_ids)
+    cursor.execute("UPDATE giveaways SET is_active = FALSE, winners_json = ? WHERE id = ?", (winners_json_str, giveaway_id))
+    conn.commit()
+    conn.close()
+
+def get_giveaway_details(message_id: int) -> dict | None: # Może być też po giveaway_id
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    # Zakładamy, że message_id jest unikalne dla aktywnych/ostatnich konkursów,
+    # ale jeśli chcemy historię, lepiej po giveaway_id. Na razie po message_id.
+    cursor.execute("""
+    SELECT id, guild_id, channel_id, prize, winner_count, created_by_id, created_at, ends_at,
+           is_active, required_role_id, min_level, winners_json
+    FROM giveaways
+    WHERE message_id = ?
+    """, (message_id,)) # Można dodać ORDER BY created_at DESC LIMIT 1 jeśli message_id nie jest UNIQUE globalnie
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {
+            "id": row[0], "guild_id": row[1], "channel_id": row[2], "prize": row[3],
+            "winner_count": row[4], "created_by_id": row[5], "created_at": row[6], "ends_at": row[7],
+            "is_active": bool(row[8]), "required_role_id": row[9], "min_level": row[10],
+            "winners_json": json.loads(row[11]) if row[11] else [] # Zwróć pustą listę jeśli NULL
+        }
+    return None
