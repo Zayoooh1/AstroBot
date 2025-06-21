@@ -142,12 +142,28 @@ def init_db():
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_giveaways_guild_active_ends ON giveaways (guild_id, is_active, ends_at)")
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS custom_commands (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        command_name TEXT NOT NULL,
+        response_type TEXT NOT NULL CHECK(response_type IN ('text', 'embed')),
+        response_content TEXT NOT NULL,
+        created_by_id INTEGER,
+        created_at INTEGER,
+        last_edited_by_id INTEGER,
+        last_edited_at INTEGER,
+        UNIQUE (guild_id, command_name)
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_custom_commands_guild_name ON custom_commands (guild_id, command_name)")
+
     conn.commit()
     conn.close()
 
 if __name__ == '__main__':
     init_db()
-    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs', 'quiz_questions', 'banned_words', 'punishments', 'level_rewards', 'polls', 'poll_options' i 'giveaways'.")
+    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs', 'quiz_questions', 'banned_words', 'punishments', 'level_rewards', 'polls', 'poll_options', 'giveaways' i 'custom_commands'.")
 
 def update_server_config(guild_id: int, welcome_message_content: str = None,
                          reaction_role_id: int = None, reaction_message_id: int = None,
@@ -157,7 +173,8 @@ def update_server_config(guild_id: int, welcome_message_content: str = None,
                          filter_spam_enabled: bool = None,
                          filter_invites_enabled: bool = None,
                          muted_role_id: int = None,
-                         moderator_actions_log_channel_id: int = None
+                         moderator_actions_log_channel_id: int = None,
+                         custom_command_prefix: str = None
                          ):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -182,6 +199,7 @@ def update_server_config(guild_id: int, welcome_message_content: str = None,
     add_update("filter_invites_enabled", filter_invites_enabled)
     add_update("muted_role_id", muted_role_id)
     add_update("moderator_actions_log_channel_id", moderator_actions_log_channel_id)
+    add_update("custom_command_prefix", custom_command_prefix)
 
     if updates:
         sql = f"UPDATE server_configs SET {', '.join(updates)} WHERE guild_id = ?"
@@ -202,7 +220,8 @@ def get_server_config(guild_id: int):
         "unverified_role_id": None, "verified_role_id": None,
         "moderation_log_channel_id": None,
         "filter_profanity_enabled": True, "filter_spam_enabled": True, "filter_invites_enabled": True,
-        "muted_role_id": None, "moderator_actions_log_channel_id": None
+        "muted_role_id": None, "moderator_actions_log_channel_id": None,
+        "custom_command_prefix": "!" # Domyślny prefix
     }
 
     select_cols_str = ", ".join([key for key in all_config_keys if key in available_columns])
@@ -718,6 +737,80 @@ def get_poll_details(poll_id: int) -> dict | None:
     poll_data["options"] = get_poll_options(poll_id) # Pobierz opcje dla tej ankiety
     conn.close()
     return poll_data
+
+# --- Funkcje dla Niestandardowych Komend (Custom Commands) ---
+def add_custom_command(guild_id: int, name: str, response_type: str, content: str, creator_id: int) -> int | None:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    created_at_ts = int(time.time())
+    try:
+        cursor.execute("""
+        INSERT INTO custom_commands (guild_id, command_name, response_type, response_content, created_by_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """, (guild_id, name.lower(), response_type, content, creator_id, created_at_ts))
+        command_id = cursor.lastrowid
+        conn.commit()
+        return command_id
+    except sqlite3.IntegrityError: # Nazwa komendy już istnieje
+        conn.rollback()
+        return None
+    finally:
+        conn.close()
+
+def edit_custom_command(guild_id: int, name: str, new_response_type: str, new_content: str, editor_id: int) -> bool:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    last_edited_at_ts = int(time.time())
+    cursor.execute("""
+    UPDATE custom_commands
+    SET response_type = ?, response_content = ?, last_edited_by_id = ?, last_edited_at = ?
+    WHERE guild_id = ? AND command_name = ?
+    """, (new_response_type, new_content, editor_id, last_edited_at_ts, guild_id, name.lower()))
+    updated_rows = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return updated_rows > 0
+
+def remove_custom_command(guild_id: int, name: str) -> bool:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM custom_commands WHERE guild_id = ? AND command_name = ?", (guild_id, name.lower()))
+    deleted_rows = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return deleted_rows > 0
+
+def get_custom_command(guild_id: int, name: str) -> dict | None:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT id, response_type, response_content, created_by_id, created_at, last_edited_by_id, last_edited_at
+    FROM custom_commands
+    WHERE guild_id = ? AND command_name = ?
+    """, (guild_id, name.lower()))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {
+            "id": row[0], "response_type": row[1], "response_content": row[2],
+            "created_by_id": row[3], "created_at": row[4],
+            "last_edited_by_id": row[5], "last_edited_at": row[6]
+        }
+    return None
+
+def get_all_custom_commands(guild_id: int) -> list[dict]:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT id, command_name, response_type
+    FROM custom_commands
+    WHERE guild_id = ?
+    ORDER BY command_name ASC
+    """, (guild_id,))
+    commands_list = [{"id": row[0], "command_name": row[1], "response_type": row[2]} for row in cursor.fetchall()]
+    conn.close()
+    return commands_list
+
 
 # --- Funkcje dla Konkursów (Giveaways) ---
 # import json # Już zaimportowany na górze
