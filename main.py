@@ -1336,6 +1336,163 @@ async def kick_command_error(interaction: discord.Interaction, error: app_comman
             await interaction.followup.send(f"Wystąpił błąd przy komendzie /kick: {error}", ephemeral=True)
         print(f"Błąd w kick_command_error: {error}")
 
+# --- Komenda /warn ---
+@bot.tree.command(name="warn", description="Rejestruje ostrzeżenie dla użytkownika.")
+@app_commands.describe(uzytkownik="Użytkownik, któremu nadać ostrzeżenie.", powod="Powód ostrzeżenia.")
+@app_commands.checks.has_permissions(moderate_members=True) # Lub kick_members, jeśli warn ma być mniej restrykcyjne
+async def warn_command(interaction: discord.Interaction, uzytkownik: discord.Member, powod: str):
+    if not interaction.guild_id or not interaction.guild:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    if uzytkownik == interaction.user:
+        await interaction.response.send_message("Nie możesz ostrzec samego siebie.", ephemeral=True)
+        return
+    if uzytkownik.bot:
+        await interaction.response.send_message("Nie możesz ostrzec bota.", ephemeral=True)
+        return
+
+    # Sprawdzenie hierarchii ról
+    if interaction.user.top_role <= uzytkownik.top_role and interaction.guild.owner_id != interaction.user.id:
+        await interaction.response.send_message("Nie możesz ostrzec kogoś z taką samą lub wyższą najwyższą rolą.", ephemeral=True)
+        return
+    # Dla samego ostrzeżenia, hierarchia roli bota względem celu nie jest tak krytyczna jak przy mute/ban,
+    # bo nie modyfikujemy bezpośrednio ról użytkownika przez bota. Ale warto zachować spójność.
+    # if interaction.guild.me.top_role <= uzytkownik.top_role:
+    #      await interaction.response.send_message(f"Moja rola jest zbyt niska, by formalnie zarządzać karami dla {uzytkownik.mention}, ale zarejestruję ostrzeżenie.", ephemeral=True)
+    #      pass # Pozwól kontynuować, ale może z notatką. Na razie pomijamy to sprawdzenie dla samego warna.
+
+    try:
+        punishment_id = database.add_punishment(
+            guild_id=interaction.guild_id,
+            user_id=uzytkownik.id,
+            moderator_id=interaction.user.id,
+            punishment_type="warn",
+            reason=powod,
+            expires_at=None, # Ostrzeżenia nie wygasają w sensie bycia aktywną karą blokującą
+            # active=True (domyślnie w add_punishment) - oznacza, że wpis jest ważnym, aktywnym przypadkiem
+        )
+
+        server_config = database.get_server_config(interaction.guild_id)
+        await log_moderator_action(
+            guild=interaction.guild,
+            moderator=interaction.user,
+            target_user=uzytkownik,
+            action_type="WARN",
+            reason=powod,
+            log_channel_id=server_config.get("moderator_actions_log_channel_id") if server_config else None,
+            punishment_id=punishment_id
+        )
+
+        await interaction.response.send_message(f"Pomyślnie zarejestrowano ostrzeżenie dla {uzytkownik.mention}. Powód: {powod}", ephemeral=True)
+
+        try:
+            dm_message = f"Otrzymałeś/aś ostrzeżenie na serwerze **{interaction.guild.name}**."
+            if powod:
+                dm_message += f"\nPowód: {powod}"
+            dm_message += f"\nID Przypadku: {punishment_id}"
+            await uzytkownik.send(dm_message)
+        except discord.Forbidden:
+            await interaction.followup.send(f"(Nie udało się wysłać powiadomienia DM do {uzytkownik.mention})", ephemeral=True)
+
+    except Exception as e:
+        await interaction.response.send_message(f"Wystąpił nieoczekiwany błąd: {e}", ephemeral=True)
+        print(f"Błąd w /warn: {e}")
+
+@warn_command.error
+async def warn_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień do nadawania ostrzeżeń (np. Moderate Members).", ephemeral=True)
+    else:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"Wystąpił błąd przy komendzie /warn: {error}", ephemeral=True)
+        else:
+            await interaction.followup.send(f"Wystąpił błąd przy komendzie /warn: {error}", ephemeral=True)
+        print(f"Błąd w warn_command_error: {error}")
+
+# --- Komenda /history (lub /cases) ---
+@bot.tree.command(name="history", description="Wyświetla historię przypadków moderacyjnych dla użytkownika.")
+@app_commands.describe(uzytkownik="Użytkownik, którego historię chcesz zobaczyć.")
+@app_commands.checks.has_permissions(moderate_members=True) # Dostęp dla moderatorów
+async def history_command(interaction: discord.Interaction, uzytkownik: discord.Member):
+    if not interaction.guild_id or not interaction.guild:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    cases = database.get_user_punishments(interaction.guild_id, uzytkownik.id)
+
+    if not cases:
+        await interaction.response.send_message(f"Brak zarejestrowanych przypadków moderacyjnych dla {uzytkownik.mention}.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"Historia Moderacyjna: {uzytkownik.display_name} ({uzytkownik.id})",
+        color=discord.Color.light_grey()
+    )
+    embed.set_thumbnail(url=uzytkownik.display_avatar.url)
+
+    # Paginacja, jeśli przypadków jest dużo. Na razie wyświetlmy np. do 5-10 ostatnich,
+    # lub zaimplementujmy prostą paginację po polach embeda.
+    # Discord ma limit 25 pól na embed. Każdy case to kilka pól.
+    # Zróbmy tak, że każdy case to jedno pole z wartością wieloliniową.
+
+    fields_added = 0
+    for case in cases:
+        if fields_added >= 5: # Wyświetl do 5 przypadków na jednym embedzie (każdy case jako jedno duże pole)
+                              # Można to dostosować lub zrobić prawdziwą paginację z przyciskami.
+            embed.set_footer(text=f"Wyświetlono {fields_added} z {len(cases)} przypadków. Użyj bardziej zaawansowanych narzędzi do pełnej historii.")
+            break
+
+        moderator = interaction.guild.get_member(case['moderator_id']) # Spróbuj pobrać jako member
+        if not moderator: # Jeśli moderatora nie ma już na serwerze, użyj ID
+            moderator_mention = f"ID: {case['moderator_id']}"
+        else:
+            moderator_mention = moderator.mention
+
+        case_details = (
+            f"**Typ:** {case['type'].upper()}\n"
+            f"**Moderator:** {moderator_mention}\n"
+            f"**Data:** <t:{case['created_at']}:F>\n"
+            f"**Powód:** {case['reason'] if case['reason'] else 'Nie podano'}\n"
+        )
+        if case['type'] in ['mute', 'ban'] and case['expires_at']:
+            status = "Aktywna" if case['active'] and case['expires_at'] > time.time() else "Wygasła/Nieaktywna"
+            if not case['active'] and case['expires_at'] and case['expires_at'] <= time.time():
+                status = "Wygasła (Automatycznie)"
+            elif not case['active']:
+                status = "Nieaktywna (Manualnie)"
+
+            case_details += f"**Wygasa:** <t:{case['expires_at']}:R> (<t:{case['expires_at']}:F>)\n"
+            case_details += f"**Status:** {status}\n"
+        elif case['type'] in ['mute', 'ban']: # Permanentne
+             status = "Aktywna" if case['active'] else "Nieaktywna (Manualnie)"
+             case_details += f"**Status:** {status} (Permanentna)\n"
+        elif case['type'] == 'kick':
+            case_details += f"**Status:** Wykonano\n"
+        elif case['type'] == 'warn':
+             case_details += f"**Status:** Zarejestrowano\n"
+
+
+        embed.add_field(name=f"Przypadek #{case['id']}", value=case_details, inline=False)
+        fields_added += 1
+
+    if not fields_added and cases: # Jeśli były przypadki, ale żaden nie został dodany (np. przez zbyt restrykcyjny limit)
+        embed.description = "Znaleziono przypadki, ale wystąpił problem z ich wyświetleniem w tym formacie."
+
+    await interaction.response.send_message(embed=embed, ephemeral=True) # Ephemeral dla prywatności moderatora
+
+@history_command.error
+async def history_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień do przeglądania historii moderacyjnej (np. Moderate Members).", ephemeral=True)
+    else:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"Wystąpił błąd przy komendzie /history: {error}", ephemeral=True)
+        else:
+            await interaction.followup.send(f"Wystąpił błąd przy komendzie /history: {error}", ephemeral=True)
+        print(f"Błąd w history_command_error: {error}")
+
+
 # --- Zadanie w Tle do Automatycznego Zdejmowania Kar ---
 
 @tasks.loop(minutes=1) # Sprawdzaj co minutę
