@@ -537,6 +537,96 @@ async def list_custom_commands_error(interaction: discord.Interaction, error: ap
         else: await interaction.followup.send(f"Błąd: {error}", ephemeral=True)
         print(f"Błąd w list_custom_commands_error: {error}")
 
+# --- System Anonimowego Feedbacku ---
+
+@bot.tree.command(name="set_feedback_channel", description="Ustawia kanał, na który będą przesyłane anonimowe wiadomości feedbacku.")
+@app_commands.describe(kanal="Kanał tekstowy dla anonimowego feedbacku.")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_feedback_channel_command(interaction: discord.Interaction, kanal: discord.TextChannel):
+    if not interaction.guild_id:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+    try:
+        database.update_server_config(guild_id=interaction.guild_id, feedback_channel_id=kanal.id)
+        await interaction.response.send_message(f"Kanał dla anonimowego feedbacku został ustawiony na {kanal.mention}.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Wystąpił błąd podczas ustawiania kanału: {e}", ephemeral=True)
+        print(f"Błąd w /set_feedback_channel: {e}")
+
+@set_feedback_channel_command.error
+async def set_feedback_channel_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień administratora, aby użyć tej komendy.", ephemeral=True)
+    else:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)
+        else:
+            await interaction.followup.send(f"Wystąpił błąd: {error}", ephemeral=True)
+        print(f"Błąd w set_feedback_channel_error: {error}")
+
+@bot.tree.command(name="feedback", description="Wysyła anonimową wiadomość/opinię do administracji serwera.")
+@app_commands.describe(wiadomosc="Treść Twojej anonimowej wiadomości.")
+async def feedback_command(interaction: discord.Interaction, wiadomosc: str):
+    if not interaction.guild_id or not interaction.guild:
+        # Teoretycznie, jeśli chcemy pozwolić na feedback z DM o konkretnym serwerze,
+        # musielibyśmy dodać argument guild_id do komendy, co komplikuje sprawę.
+        # Na razie ograniczamy do użycia na serwerze.
+        await interaction.response.send_message("Tej komendy można użyć tylko na serwerze.", ephemeral=True)
+        return
+
+    if not wiadomosc.strip():
+        await interaction.response.send_message("Wiadomość feedbacku nie może być pusta.", ephemeral=True)
+        return
+
+    server_config = database.get_server_config(interaction.guild_id)
+    if not server_config or not server_config.get("feedback_channel_id"):
+        await interaction.response.send_message(
+            "Funkcja anonimowego feedbacku nie jest jeszcze skonfigurowana na tym serwerze. Skontaktuj się z administratorem.",
+            ephemeral=True
+        )
+        return
+
+    feedback_channel_id = server_config["feedback_channel_id"]
+    feedback_channel = interaction.guild.get_channel(feedback_channel_id)
+
+    if not feedback_channel or not isinstance(feedback_channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "Skonfigurowany kanał do feedbacku nie został znaleziony lub nie jest kanałem tekstowym. Skontaktuj się z administratorem.",
+            ephemeral=True
+        )
+        # Dodatkowo można zalogować ten błąd dla admina serwera
+        print(f"Błąd (feedback): Nie znaleziono kanału feedback (ID: {feedback_channel_id}) na serwerze {interaction.guild.name}")
+        return
+
+    try:
+        # Tworzenie embedu dla anonimowego feedbacku
+        embed = discord.Embed(
+            title=" otrzymano", # Celowo bez emoji na początku, aby nie sugerować bota jako autora
+            description=f"```{wiadomosc}```",
+            color=discord.Color.light_grey(), # Neutralny kolor
+            timestamp=datetime.utcnow()
+        )
+        # Nie ustawiamy autora ani stopki, która mogłaby zdradzić użytkownika
+        # Można dodać np. ID serwera do stopki, jeśli bot jest na wielu serwerach i admini bota chcą wiedzieć skąd jest feedback
+        embed.set_footer(text=f"Anonimowy Feedback | Serwer: {interaction.guild.name}")
+
+
+        await feedback_channel.send(embed=embed)
+        await interaction.response.send_message("Twój anonimowy feedback został pomyślnie przesłany. Dziękujemy!", ephemeral=True)
+        print(f"Przesłano anonimowy feedback na serwerze {interaction.guild.name} do kanału {feedback_channel.name}")
+
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "Nie udało mi się wysłać Twojego feedbacku na skonfigurowany kanał (brak uprawnień). Skontaktuj się z administratorem.",
+            ephemeral=True
+        )
+        print(f"Błąd (feedback): Brak uprawnień do wysyłania na kanał feedback (ID: {feedback_channel_id}) na serwerze {interaction.guild.name}")
+    except Exception as e:
+        await interaction.response.send_message(f"Wystąpił nieoczekiwany błąd podczas wysyłania feedbacku: {e}", ephemeral=True)
+        print(f"Błąd w /feedback: {e}")
+
+# Nie ma potrzeby error handlera dla /feedback, bo nie ma specjalnych uprawnień.
+# Chyba że chcemy logować wszystkie błędy inaczej.
 # --- Pozostałe funkcje pomocnicze i taski (skrócone dla zwięzłości) ---
 # (send_quiz_question_dm, process_quiz_results, log_moderation_action, _handle_giveaway_end_logic)
 # (check_expired_roles, check_expired_punishments_task, check_expired_polls_task, check_ended_giveaways_task)
