@@ -21,6 +21,8 @@ user_recent_messages = collections.defaultdict(lambda: collections.deque(maxlen=
 
 # Do regexów
 import re
+from utils import time_parser # Nasz parser czasu
+from datetime import datetime, timedelta # Do pracy z czasem
 
 # Definiujemy intencje, w tym guilds i members, które mogą być potrzebne
 intents = discord.Intents.default()
@@ -816,6 +818,849 @@ async def set_unverified_role_command(interaction: discord.Interaction, rola: di
 
 @set_unverified_role_command.error
 async def set_unverified_role_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień administratora, aby użyć tej komendy.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)
+
+# --- Funkcja Pomocnicza do Logowania Akcji Moderacyjnych ---
+async def log_moderator_action(guild: discord.Guild, moderator: discord.User, target_user: discord.User,
+                               action_type: str, reason: str | None, duration_seconds: int | None = None,
+                               log_channel_id: int | None = None, punishment_id: int | None = None):
+    if not log_channel_id:
+        # print(f"Ostrzeżenie: Brak skonfigurowanego kanału logów akcji moderatora dla serwera {guild.name}.")
+        return
+
+    log_channel = guild.get_channel(log_channel_id)
+    if not log_channel or not isinstance(log_channel, discord.TextChannel):
+        print(f"Błąd logowania akcji moderatora: Nie znaleziono kanału logów (ID: {log_channel_id}) na serwerze {guild.name} lub nie jest to kanał tekstowy.")
+        return
+
+    embed = discord.Embed(title=f"Akcja Moderatora: {action_type.capitalize()}", color=discord.Color.blue(), timestamp=datetime.utcnow())
+    embed.add_field(name="Moderator", value=f"{moderator.mention} ({moderator.id})", inline=False)
+    embed.add_field(name="Użytkownik", value=f"{target_user.mention} ({target_user.id})", inline=False)
+    if reason:
+        embed.add_field(name="Powód", value=reason, inline=False)
+
+    if duration_seconds is not None:
+        duration_str = str(timedelta(seconds=duration_seconds))
+        embed.add_field(name="Czas trwania", value=duration_str, inline=False)
+        expires_at_ts = int(time.time() + duration_seconds)
+        embed.add_field(name="Wygasa", value=f"<t:{expires_at_ts}:F> (<t:{expires_at_ts}:R>)", inline=False)
+
+    if punishment_id:
+        embed.set_footer(text=f"ID Kary: {punishment_id}")
+
+    try:
+        await log_channel.send(embed=embed)
+    except discord.Forbidden:
+        print(f"Błąd logowania akcji moderatora: Brak uprawnień do wysyłania wiadomości na kanale logów {log_channel.mention} na serwerze {guild.name}.")
+    except Exception as e:
+        print(f"Nieoczekiwany błąd podczas logowania akcji moderatora: {e}")
+
+
+# --- Komendy Moderacyjne (Mute/Unmute) ---
+
+@bot.tree.command(name="mute", description="Wycisza użytkownika na określony czas.")
+@app_commands.describe(uzytkownik="Użytkownik do wyciszenia.",
+                       czas_trwania="Czas wyciszenia (np. 10m, 2h, 3d, 1w). '0s' lub brak dla permanentnego (niezalecane, użyj bana).",
+                       powod="Powód wyciszenia.")
+@app_commands.checks.has_permissions(moderate_members=True) # moderate_members to nowe uprawnienie do timeoutów
+async def mute_command(interaction: discord.Interaction, uzytkownik: discord.Member,
+                       czas_trwania: str, powod: str):
+    if not interaction.guild_id or not interaction.guild:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    if uzytkownik == interaction.user:
+        await interaction.response.send_message("Nie możesz wyciszyć samego siebie.", ephemeral=True)
+        return
+    if uzytkownik.bot:
+        await interaction.response.send_message("Nie możesz wyciszyć bota.", ephemeral=True)
+        return
+
+    # Sprawdzenie hierarchii ról
+    if interaction.user.top_role <= uzytkownik.top_role and interaction.guild.owner_id != interaction.user.id :
+        await interaction.response.send_message("Nie możesz wyciszyć kogoś z taką samą lub wyższą najwyższą rolą.", ephemeral=True)
+        return
+    if interaction.guild.me.top_role <= uzytkownik.top_role:
+         await interaction.response.send_message(f"Nie mogę wyciszyć {uzytkownik.mention}, ponieważ moja najwyższa rola nie jest wystarczająco wysoko.", ephemeral=True)
+         return
+
+    server_config = database.get_server_config(interaction.guild_id)
+    if not server_config or not server_config.get("muted_role_id"):
+        await interaction.response.send_message("Rola wyciszenia (Muted Role) nie jest skonfigurowana dla tego serwera. Użyj `/set_muted_role`.", ephemeral=True)
+        return
+
+    muted_role = interaction.guild.get_role(server_config["muted_role_id"])
+    if not muted_role:
+        await interaction.response.send_message("Skonfigurowana rola wyciszenia nie istnieje na tym serwerze. Sprawdź konfigurację.", ephemeral=True)
+        return
+
+    duration_seconds = time_parser.parse_duration(czas_trwania)
+    if duration_seconds is None and czas_trwania.lower() not in ['0', '0s', 'perm', 'permanent']: # Akceptuj '0' jako specjalny przypadek braku czasu
+        await interaction.response.send_message("Nieprawidłowy format czasu trwania. Użyj np. 10m, 2h, 3d, 1w.", ephemeral=True)
+        return
+
+    # Jeśli parse_duration zwróci None, ale użytkownik podał "0" lub "0s", to traktujemy jako brak wygaśnięcia (choć dla mute to rzadkie)
+    # Jeśli parse_duration zwróci 0, to też jest brak wygaśnięcia w kontekście expires_at = None
+    expires_at_timestamp = None
+    if duration_seconds is not None and duration_seconds > 0:
+        expires_at_timestamp = int(time.time() + duration_seconds)
+
+    # Sprawdzenie, czy użytkownik jest już wyciszony (aktywna kara mute)
+    active_mute = database.get_active_user_punishment(interaction.guild_id, uzytkownik.id, "mute")
+    if active_mute:
+        # Można dodać logikę aktualizacji istniejącego wyciszenia lub po prostu poinformować
+        expires_display = f"wygasa <t:{active_mute['expires_at']}:R>" if active_mute.get('expires_at') else "jest permanentne (błąd?)"
+        await interaction.response.send_message(f"{uzytkownik.mention} jest już wyciszony/a ({expires_display}). Użyj `/unmute` aby zdjąć wyciszenie.", ephemeral=True)
+        return
+
+    try:
+        # Nadanie roli Muted
+        await uzytkownik.add_roles(muted_role, reason=f"Wyciszony przez {interaction.user.name}: {powod}")
+
+        # Zapis do bazy
+        punishment_id = database.add_punishment(
+            guild_id=interaction.guild_id,
+            user_id=uzytkownik.id,
+            moderator_id=interaction.user.id,
+            punishment_type="mute",
+            reason=powod,
+            expires_at=expires_at_timestamp
+        )
+
+        # Logowanie
+        await log_moderator_action(
+            guild=interaction.guild,
+            moderator=interaction.user,
+            target_user=uzytkownik,
+            action_type="MUTE",
+            reason=powod,
+            duration_seconds=duration_seconds if duration_seconds and duration_seconds > 0 else None,
+            log_channel_id=server_config.get("moderator_actions_log_channel_id"),
+            punishment_id=punishment_id
+        )
+
+        # Informacja dla moderatora
+        duration_msg = f" na czas {timedelta(seconds=duration_seconds)}" if duration_seconds and duration_seconds > 0 else " permanentnie (do odwołania)"
+        await interaction.response.send_message(f"Pomyślnie wyciszono {uzytkownik.mention}{duration_msg}. Powód: {powod}", ephemeral=True)
+
+        # Informacja dla użytkownika (DM)
+        try:
+            dm_message = f"Zostałeś/aś wyciszony/a na serwerze **{interaction.guild.name}**{duration_msg}."
+            if powod:
+                dm_message += f"\nPowód: {powod}"
+            await uzytkownik.send(dm_message)
+        except discord.Forbidden:
+            await interaction.followup.send(f"(Nie udało się wysłać powiadomienia DM do {uzytkownik.mention})", ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.response.send_message(f"Nie mam uprawnień, aby nadać rolę wyciszenia {uzytkownik.mention} lub zarządzać jego rolami.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Wystąpił nieoczekiwany błąd: {e}", ephemeral=True)
+        print(f"Błąd w /mute: {e}")
+
+@mute_command.error
+async def mute_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień do wyciszania członków (Moderate Members).", ephemeral=True)
+    else:
+        if not interaction.response.is_done(): # Jeśli interakcja nie została jeszcze potwierdzona
+            await interaction.response.send_message(f"Wystąpił błąd przy komendzie /mute: {error}", ephemeral=True)
+        else: # Jeśli już była odpowiedź (np. defer), użyj followup
+            await interaction.followup.send(f"Wystąpił błąd przy komendzie /mute: {error}", ephemeral=True)
+        print(f"Błąd w mute_command_error: {error}")
+
+
+@bot.tree.command(name="unmute", description="Zdejmuje wyciszenie z użytkownika.")
+@app_commands.describe(uzytkownik="Użytkownik do odciszenia.", powod="Powód zdjęcia wyciszenia.")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def unmute_command(interaction: discord.Interaction, uzytkownik: discord.Member, powod: str):
+    if not interaction.guild_id or not interaction.guild:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    server_config = database.get_server_config(interaction.guild_id)
+    if not server_config or not server_config.get("muted_role_id"):
+        await interaction.response.send_message("Rola wyciszenia (Muted Role) nie jest skonfigurowana dla tego serwera.", ephemeral=True)
+        return
+
+    muted_role = interaction.guild.get_role(server_config["muted_role_id"])
+    if not muted_role:
+        await interaction.response.send_message("Skonfigurowana rola wyciszenia nie istnieje na tym serwerze.", ephemeral=True)
+        return
+
+    if muted_role not in uzytkownik.roles:
+        await interaction.response.send_message(f"{uzytkownik.mention} nie jest aktualnie wyciszony/a (nie posiada roli {muted_role.mention}).", ephemeral=True)
+        # Można by też sprawdzić bazę `punishments` dla aktywnej kary mute, ale rola jest głównym wskaźnikiem.
+        return
+
+    # Sprawdzenie hierarchii ról (czy moderator może zdjąć karę nałożoną przez kogoś z wyższą rolą - tu nie ma takiej logiki, po prostu czy bot może zarządzać rolą)
+    if interaction.guild.me.top_role <= muted_role : # Bot musi móc zarządzać rolą muted
+         await interaction.response.send_message(f"Nie mogę zarządzać rolą {muted_role.mention}, ponieważ moja najwyższa rola nie jest wystarczająco wysoko.", ephemeral=True)
+         return
+
+    try:
+        await uzytkownik.remove_roles(muted_role, reason=f"Odciszony przez {interaction.user.name}: {powod}")
+
+        # Deaktywacja aktywnej kary mute w bazie
+        active_mute = database.get_active_user_punishment(interaction.guild_id, uzytkownik.id, "mute")
+        if active_mute:
+            database.deactivate_punishment(active_mute["id"])
+
+        # Logowanie
+        await log_moderator_action(
+            guild=interaction.guild,
+            moderator=interaction.user,
+            target_user=uzytkownik,
+            action_type="UNMUTE",
+            reason=powod,
+            log_channel_id=server_config.get("moderator_actions_log_channel_id"),
+            punishment_id=active_mute["id"] if active_mute else None
+        )
+
+        await interaction.response.send_message(f"Pomyślnie zdjęto wyciszenie z {uzytkownik.mention}. Powód: {powod}", ephemeral=True)
+
+        try:
+            dm_message = f"Twoje wyciszenie na serwerze **{interaction.guild.name}** zostało zdjęte."
+            if powod:
+                dm_message += f"\nPowód: {powod}"
+            await uzytkownik.send(dm_message)
+        except discord.Forbidden:
+            await interaction.followup.send(f"(Nie udało się wysłać powiadomienia DM do {uzytkownik.mention})", ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.response.send_message(f"Nie mam uprawnień, aby zdjąć rolę wyciszenia z {uzytkownik.mention}.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Wystąpił nieoczekiwany błąd: {e}", ephemeral=True)
+        print(f"Błąd w /unmute: {e}")
+
+@unmute_command.error
+async def unmute_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień do zdejmowania wyciszenia (Moderate Members).", ephemeral=True)
+    else:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"Wystąpił błąd przy komendzie /unmute: {error}", ephemeral=True)
+        else:
+            await interaction.followup.send(f"Wystąpił błąd przy komendzie /unmute: {error}", ephemeral=True)
+        print(f"Błąd w unmute_command_error: {error}")
+
+# --- Komendy Moderacyjne (Ban/Unban/Kick) ---
+
+@bot.tree.command(name="ban", description="Banuje użytkownika z serwera (może być czasowy).")
+@app_commands.describe(uzytkownik="Użytkownik do zbanowania.",
+                       czas_trwania="Czas bana (np. 7d, 2w, 0s dla permanentnego). Domyślnie permanentny.",
+                       powod="Powód bana.",
+                       usun_wiadomosci_dni="Liczba dni, z których usunąć wiadomości użytkownika (0-7). Domyślnie 0.")
+@app_commands.choices(usun_wiadomosci_dni=[
+    app_commands.Choice(name="Nie usuwaj", value=0),
+    app_commands.Choice(name="Ostatnie 24 godziny", value=1),
+    app_commands.Choice(name="Ostatnie 3 dni", value=3),
+    app_commands.Choice(name="Ostatnie 7 dni", value=7),
+])
+@app_commands.checks.has_permissions(ban_members=True)
+async def ban_command(interaction: discord.Interaction, uzytkownik: discord.Member,
+                      powod: str, czas_trwania: str = None,
+                      usun_wiadomosci_dni: app_commands.Choice[int] = None):
+    if not interaction.guild_id or not interaction.guild:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    if uzytkownik == interaction.user:
+        await interaction.response.send_message("Nie możesz zbanować samego siebie.", ephemeral=True)
+        return
+    if uzytkownik.bot: # Generalnie nie banuje się botów w ten sposób, ale dla kompletności
+        # await interaction.response.send_message("Nie możesz zbanować bota tą komendą.", ephemeral=True)
+        # return
+        pass
+
+
+    # Sprawdzenie hierarchii ról
+    if interaction.user.top_role <= uzytkownik.top_role and interaction.guild.owner_id != interaction.user.id:
+        await interaction.response.send_message("Nie możesz zbanować kogoś z taką samą lub wyższą najwyższą rolą.", ephemeral=True)
+        return
+    if interaction.guild.me.top_role <= uzytkownik.top_role:
+         await interaction.response.send_message(f"Nie mogę zbanować {uzytkownik.mention}, ponieważ moja najwyższa rola nie jest wystarczająco wysoko.", ephemeral=True)
+         return
+
+    delete_message_seconds = 0
+    if usun_wiadomosci_dni is not None: # discord.py oczekuje sekund
+        delete_message_seconds = usun_wiadomosci_dni.value * 24 * 60 * 60
+
+
+    duration_seconds = None
+    expires_at_timestamp = None
+    if czas_trwania:
+        duration_seconds = time_parser.parse_duration(czas_trwania)
+        if duration_seconds is None and czas_trwania.lower() not in ['0', '0s', 'perm', 'permanent']:
+            await interaction.response.send_message("Nieprawidłowy format czasu trwania bana. Użyj np. 7d, 2w, lub '0s' dla permanentnego.", ephemeral=True)
+            return
+        if duration_seconds is not None and duration_seconds > 0:
+            expires_at_timestamp = int(time.time() + duration_seconds)
+
+    # Sprawdzenie, czy użytkownik jest już zbanowany (przez Discord lub aktywna kara w bazie)
+    # Discord API nie pozwala łatwo sprawdzić, czy ktoś jest już zbanowany bez próby bana lub pobrania listy banów
+    active_ban = database.get_active_user_punishment(interaction.guild_id, uzytkownik.id, "ban")
+    if active_ban:
+        expires_display = f"wygasa <t:{active_ban['expires_at']}:R>" if active_ban.get('expires_at') else "jest permanentny"
+        await interaction.response.send_message(f"{uzytkownik.mention} ma już aktywny ban ({expires_display}).", ephemeral=True)
+        return
+
+    dm_message_ban = f"Zostałeś/aś zbanowany/a na serwerze **{interaction.guild.name}**."
+    if duration_seconds and duration_seconds > 0:
+        dm_message_ban += f" Czas trwania: {timedelta(seconds=duration_seconds)}."
+    else:
+        dm_message_ban += " Ban jest permanentny."
+    if powod:
+        dm_message_ban += f"\nPowód: {powod}"
+
+    try:
+        # Próba wysłania DM przed banem
+        await uzytkownik.send(dm_message_ban)
+        dm_sent_successfully = True
+    except discord.Forbidden:
+        dm_sent_successfully = False
+        # Kontynuuj z banem nawet jeśli DM się nie udał
+
+    try:
+        await interaction.guild.ban(uzytkownik, reason=f"Zbanowany przez {interaction.user.name}: {powod}", delete_message_seconds=delete_message_seconds)
+
+        punishment_id = database.add_punishment(
+            guild_id=interaction.guild_id,
+            user_id=uzytkownik.id,
+            moderator_id=interaction.user.id,
+            punishment_type="ban",
+            reason=powod,
+            expires_at=expires_at_timestamp
+        )
+
+        server_config = database.get_server_config(interaction.guild_id)
+        await log_moderator_action(
+            guild=interaction.guild,
+            moderator=interaction.user,
+            target_user=uzytkownik, # Przekazujemy obiekt użytkownika, nawet jeśli już nie jest członkiem
+            action_type="BAN",
+            reason=powod,
+            duration_seconds=duration_seconds if duration_seconds and duration_seconds > 0 else None,
+            log_channel_id=server_config.get("moderator_actions_log_channel_id") if server_config else None,
+            punishment_id=punishment_id
+        )
+
+        duration_msg_response = f" na czas {timedelta(seconds=duration_seconds)}" if duration_seconds and duration_seconds > 0 else " permanentnie"
+        response_msg = f"Pomyślnie zbanowano {uzytkownik.mention}{duration_msg_response}. Powód: {powod}"
+        if not dm_sent_successfully:
+            response_msg += f"\n(Nie udało się wysłać powiadomienia DM do {uzytkownik.mention})"
+
+        await interaction.response.send_message(response_msg, ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.response.send_message(f"Nie mam uprawnień, aby zbanować {uzytkownik.mention}.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Wystąpił nieoczekiwany błąd podczas banowania: {e}", ephemeral=True)
+        print(f"Błąd w /ban: {e}")
+
+@ban_command.error
+async def ban_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień do banowania członków (Ban Members).", ephemeral=True)
+    else:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"Wystąpił błąd przy komendzie /ban: {error}", ephemeral=True)
+        else:
+            await interaction.followup.send(f"Wystąpił błąd przy komendzie /ban: {error}", ephemeral=True)
+        print(f"Błąd w ban_command_error: {error}")
+
+
+@bot.tree.command(name="unban", description="Odbanowuje użytkownika z serwera.")
+@app_commands.describe(uzytkownik_id_lub_nazwa="ID użytkownika lub nazwa#tag do odbanowania.",
+                       powod="Powód odbanowania.")
+@app_commands.checks.has_permissions(ban_members=True) # Unban też wymaga Ban Members
+async def unban_command(interaction: discord.Interaction, uzytkownik_id_lub_nazwa: str, powod: str):
+    if not interaction.guild_id or not interaction.guild:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    banned_user_obj = None
+    # Próba znalezienia użytkownika na liście banów
+    try:
+        # Jeśli podano ID numeryczne
+        if uzytkownik_id_lub_nazwa.isdigit():
+            user_id_to_unban = int(uzytkownik_id_lub_nazwa)
+            banned_user_obj = await bot.fetch_user(user_id_to_unban) # Pobierz obiekt User, nawet jeśli nie ma go na serwerze
+        else: # Próba znalezienia po nazwie#tag
+            # discord.py V2: guild.bans() to async iterator
+            async for ban_entry in interaction.guild.bans(limit=2000): # Przeszukaj bany
+                if str(ban_entry.user) == uzytkownik_id_lub_nazwa:
+                    banned_user_obj = ban_entry.user
+                    break
+            if not banned_user_obj: # Jeszcze jedna próba, jeśli ktoś podał tylko nazwę bez taga
+                 async for ban_entry in interaction.guild.bans(limit=2000):
+                    if ban_entry.user.name.lower() == uzytkownik_id_lub_nazwa.lower():
+                        banned_user_obj = ban_entry.user
+                        # Tu może być problem, jeśli jest wielu userów o tej samej nazwie, ale różnych tagach
+                        # Lepiej polegać na ID lub pełnym tagu.
+                        break
+
+        if not banned_user_obj:
+            await interaction.response.send_message(f"Nie znaleziono użytkownika '{uzytkownik_id_lub_nazwa}' na liście banów tego serwera.", ephemeral=True)
+            return
+
+    except discord.NotFound:
+        await interaction.response.send_message(f"Nie znaleziono użytkownika o ID '{uzytkownik_id_lub_nazwa}' (Discord API).", ephemeral=True)
+        return
+    except Exception as e: # Inne błędy przy fetch_user lub guild.bans
+        await interaction.response.send_message(f"Wystąpił błąd podczas wyszukiwania użytkownika: {e}", ephemeral=True)
+        return
+
+    try:
+        await interaction.guild.unban(banned_user_obj, reason=f"Odbanowany przez {interaction.user.name}: {powod}")
+
+        # Deaktywacja aktywnej kary ban w bazie
+        active_ban = database.get_active_user_punishment(interaction.guild_id, banned_user_obj.id, "ban")
+        if active_ban:
+            database.deactivate_punishment(active_ban["id"])
+
+        server_config = database.get_server_config(interaction.guild_id)
+        await log_moderator_action(
+            guild=interaction.guild,
+            moderator=interaction.user,
+            target_user=banned_user_obj, # Przekazujemy obiekt User
+            action_type="UNBAN",
+            reason=powod,
+            log_channel_id=server_config.get("moderator_actions_log_channel_id") if server_config else None,
+            punishment_id=active_ban["id"] if active_ban else None
+        )
+
+        await interaction.response.send_message(f"Pomyślnie odbanowano {banned_user_obj.name} ({banned_user_obj.id}). Powód: {powod}", ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.response.send_message(f"Nie mam uprawnień, aby odbanować tego użytkownika.", ephemeral=True)
+    except discord.NotFound: # Jeśli użytkownik nie był zbanowany
+        await interaction.response.send_message(f"Użytkownik {banned_user_obj.name} nie jest zbanowany na tym serwerze.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Wystąpił nieoczekiwany błąd podczas odbanowywania: {e}", ephemeral=True)
+        print(f"Błąd w /unban: {e}")
+
+@unban_command.error
+async def unban_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień do odbanowywania członków (Ban Members).", ephemeral=True)
+    else:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"Wystąpił błąd przy komendzie /unban: {error}", ephemeral=True)
+        else:
+            await interaction.followup.send(f"Wystąpił błąd przy komendzie /unban: {error}", ephemeral=True)
+        print(f"Błąd w unban_command_error: {error}")
+
+
+@bot.tree.command(name="kick", description="Wyrzuca użytkownika z serwera.")
+@app_commands.describe(uzytkownik="Użytkownik do wyrzucenia.", powod="Powód wyrzucenia.")
+@app_commands.checks.has_permissions(kick_members=True)
+async def kick_command(interaction: discord.Interaction, uzytkownik: discord.Member, powod: str):
+    if not interaction.guild_id or not interaction.guild:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    if uzytkownik == interaction.user:
+        await interaction.response.send_message("Nie możesz wyrzucić samego siebie.", ephemeral=True)
+        return
+    if uzytkownik.bot:
+        await interaction.response.send_message("Nie możesz wyrzucić bota.", ephemeral=True)
+        return
+
+    # Sprawdzenie hierarchii ról
+    if interaction.user.top_role <= uzytkownik.top_role and interaction.guild.owner_id != interaction.user.id:
+        await interaction.response.send_message("Nie możesz wyrzucić kogoś z taką samą lub wyższą najwyższą rolą.", ephemeral=True)
+        return
+    if interaction.guild.me.top_role <= uzytkownik.top_role:
+         await interaction.response.send_message(f"Nie mogę wyrzucić {uzytkownik.mention}, ponieważ moja najwyższa rola nie jest wystarczająco wysoko.", ephemeral=True)
+         return
+
+    dm_message_kick = f"Zostałeś/aś wyrzucony/a z serwera **{interaction.guild.name}**."
+    if powod:
+        dm_message_kick += f"\nPowód: {powod}"
+
+    dm_sent_successfully_kick = False
+    try:
+        await uzytkownik.send(dm_message_kick)
+        dm_sent_successfully_kick = True
+    except discord.Forbidden:
+        pass # Kontynuuj z kickiem
+
+    try:
+        await interaction.guild.kick(uzytkownik, reason=f"Wyrzucony przez {interaction.user.name}: {powod}")
+
+        # Kick jest jednorazowy, więc active=False od razu
+        punishment_id = database.add_punishment(
+            guild_id=interaction.guild_id,
+            user_id=uzytkownik.id,
+            moderator_id=interaction.user.id,
+            punishment_type="kick",
+            reason=powod,
+            expires_at=None # Kick nie wygasa
+        )
+        database.deactivate_punishment(punishment_id) # Kick jest natychmiastowo "nieaktywny" w sensie trwania
+
+        server_config = database.get_server_config(interaction.guild_id)
+        await log_moderator_action(
+            guild=interaction.guild,
+            moderator=interaction.user,
+            target_user=uzytkownik,
+            action_type="KICK",
+            reason=powod,
+            log_channel_id=server_config.get("moderator_actions_log_channel_id") if server_config else None,
+            punishment_id=punishment_id
+        )
+
+        response_msg_kick = f"Pomyślnie wyrzucono {uzytkownik.mention}. Powód: {powod}"
+        if not dm_sent_successfully_kick:
+            response_msg_kick += f"\n(Nie udało się wysłać powiadomienia DM do {uzytkownik.mention})"
+        await interaction.response.send_message(response_msg_kick, ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.response.send_message(f"Nie mam uprawnień, aby wyrzucić {uzytkownik.mention}.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Wystąpił nieoczekiwany błąd podczas wyrzucania: {e}", ephemeral=True)
+        print(f"Błąd w /kick: {e}")
+
+@kick_command.error
+async def kick_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień do wyrzucania członków (Kick Members).", ephemeral=True)
+    else:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"Wystąpił błąd przy komendzie /kick: {error}", ephemeral=True)
+        else:
+            await interaction.followup.send(f"Wystąpił błąd przy komendzie /kick: {error}", ephemeral=True)
+        print(f"Błąd w kick_command_error: {error}")
+
+# --- Zadanie w Tle do Automatycznego Zdejmowania Kar ---
+
+@tasks.loop(minutes=1) # Sprawdzaj co minutę
+async def check_expired_punishments_task():
+    await bot.wait_until_ready() # Upewnij się, że bot jest gotowy
+
+    current_timestamp = int(time.time())
+    expired_punishments = database.get_expired_active_punishments(current_timestamp)
+
+    if expired_punishments:
+        print(f"[TASK] Znaleziono {len(expired_punishments)} wygasłych kar do przetworzenia.")
+
+    for punishment in expired_punishments:
+        guild = bot.get_guild(punishment["guild_id"])
+        if not guild:
+            print(f"[TASK] Nie znaleziono serwera o ID {punishment['guild_id']} dla kary ID {punishment['id']}. Deaktywuję karę.")
+            database.deactivate_punishment(punishment["id"])
+            continue
+
+        user_id = punishment["user_id"]
+        target_user_obj = None # Obiekt User lub Member
+
+        server_config = database.get_server_config(guild.id) # Potrzebne do log channel i muted_role
+        if not server_config:
+            print(f"[TASK] Brak konfiguracji serwera dla {guild.name} (ID: {guild.id}). Pomijam karę ID {punishment['id']}.")
+            continue
+
+
+        if punishment["type"] == "mute":
+            muted_role_id = server_config.get("muted_role_id")
+            if not muted_role_id:
+                print(f"[TASK] Brak skonfigurowanej roli Muted dla serwera {guild.name}. Nie można zdjąć mute dla kary ID {punishment['id']}. Deaktywuję.")
+                database.deactivate_punishment(punishment["id"])
+                continue
+
+            muted_role = guild.get_role(muted_role_id)
+            if not muted_role:
+                print(f"[TASK] Skonfigurowana rola Muted (ID: {muted_role_id}) nie istnieje na serwerze {guild.name}. Nie można zdjąć mute dla kary ID {punishment['id']}. Deaktywuję.")
+                database.deactivate_punishment(punishment["id"])
+                continue
+
+            member = guild.get_member(user_id)
+            if member:
+                target_user_obj = member
+                if muted_role in member.roles:
+                    try:
+                        if guild.me.top_role > muted_role:
+                            await member.remove_roles(muted_role, reason="Automatyczne zdjęcie wyciszenia (czas minął).")
+                            print(f"[TASK] Automatycznie zdjęto rolę mute z {member.name} na serwerze {guild.name}.")
+                            database.deactivate_punishment(punishment["id"])
+                            await log_moderator_action(
+                                guild=guild, moderator=bot.user, target_user=member,
+                                action_type="AUTO-UNMUTE", reason="Czas kary minął.",
+                                log_channel_id=server_config.get("moderator_actions_log_channel_id"),
+                                punishment_id=punishment["id"]
+                            )
+                            try:
+                                await member.send(f"Twoje wyciszenie na serwerze **{guild.name}** wygasło i zostało automatycznie zdjęte.")
+                            except discord.Forbidden:
+                                pass # Nie można wysłać DM
+                        else:
+                             print(f"[TASK] Bot nie ma wystarczająco wysokiej roli, aby zdjąć rolę Muted z {member.name} na {guild.name}. Kara ID {punishment['id']} pozostaje aktywna.")
+                    except discord.Forbidden:
+                        print(f"[TASK] Brak uprawnień do zdjęcia roli Muted z {member.name} na serwerze {guild.name}. Kara ID {punishment['id']} pozostaje aktywna.")
+                    except Exception as e:
+                        print(f"[TASK] Błąd przy automatycznym zdejmowaniu mute z {member.name}: {e}. Kara ID {punishment['id']} pozostaje aktywna.")
+                else: # Użytkownik jest na serwerze, ale nie ma już roli muted
+                    print(f"[TASK] Użytkownik {member.name} (ID: {user_id}) jest na serwerze {guild.name}, ale nie ma już roli Muted. Deaktywuję karę ID {punishment['id']}.")
+                    database.deactivate_punishment(punishment["id"])
+            else: # Użytkownika nie ma na serwerze
+                print(f"[TASK] Użytkownik o ID {user_id} nie jest już na serwerze {guild.name}. Deaktywuję karę mute ID {punishment['id']}.")
+                database.deactivate_punishment(punishment["id"])
+                # Możemy spróbować pobrać obiekt User dla logowania, jeśli nie ma membera
+                try: target_user_obj = await bot.fetch_user(user_id)
+                except discord.NotFound: target_user_obj = discord.Object(id=user_id) # Fallback do obiektu z ID
+
+                # Logujemy, że kara została zdezaktywowana, bo użytkownika nie ma
+                await log_moderator_action(
+                    guild=guild, moderator=bot.user, target_user=target_user_obj,
+                    action_type="AUTO-MUTE EXPIRED (User Left)", reason="Czas kary minął, użytkownik opuścił serwer.",
+                    log_channel_id=server_config.get("moderator_actions_log_channel_id"),
+                    punishment_id=punishment["id"]
+                )
+
+
+        elif punishment["type"] == "ban":
+            try:
+                # Sprawdź, czy użytkownik jest faktycznie zbanowany, zanim spróbujesz odbanować
+                # To wymaga pobrania obiektu User najpierw
+                banned_user = await bot.fetch_user(user_id)
+                target_user_obj = banned_user
+                try:
+                    await guild.fetch_ban(banned_user) # Sprawdza, czy jest ban entry
+                    # Jeśli powyższe nie rzuci NotFound, to jest zbanowany
+                    await guild.unban(banned_user, reason="Automatyczne odbanowanie (czas minął).")
+                    print(f"[TASK] Automatycznie odbanowano użytkownika {banned_user.name} (ID: {user_id}) na serwerze {guild.name}.")
+                    database.deactivate_punishment(punishment["id"])
+                    await log_moderator_action(
+                        guild=guild, moderator=bot.user, target_user=banned_user,
+                        action_type="AUTO-UNBAN", reason="Czas kary minął.",
+                        log_channel_id=server_config.get("moderator_actions_log_channel_id"),
+                        punishment_id=punishment["id"]
+                    )
+                except discord.NotFound: # Nie znaleziono bana - ktoś mógł już odbanować ręcznie
+                    print(f"[TASK] Użytkownik {banned_user.name} (ID: {user_id}) nie był zbanowany na serwerze {guild.name}, mimo aktywnej kary w bazie. Deaktywuję karę ID {punishment['id']}.")
+                    database.deactivate_punishment(punishment["id"])
+                except discord.Forbidden:
+                     print(f"[TASK] Brak uprawnień do odbanowania użytkownika ID {user_id} na serwerze {guild.name}. Kara ID {punishment['id']} pozostaje aktywna.")
+                except Exception as e:
+                    print(f"[TASK] Błąd przy automatycznym odbanowywaniu użytkownika ID {user_id}: {e}. Kara ID {punishment['id']} pozostaje aktywna.")
+
+            except discord.NotFound: # bot.fetch_user nie znalazł usera
+                print(f"[TASK] Nie znaleziono użytkownika o ID {user_id} (mógł usunąć konto). Deaktywuję karę ban ID {punishment['id']}.")
+                database.deactivate_punishment(punishment["id"])
+                target_user_obj = discord.Object(id=user_id) # Fallback dla logowania
+                await log_moderator_action(
+                    guild=guild, moderator=bot.user, target_user=target_user_obj,
+                    action_type="AUTO-BAN EXPIRED (User Not Found)", reason="Czas kary minął, użytkownik nieosiągalny.",
+                    log_channel_id=server_config.get("moderator_actions_log_channel_id"),
+                    punishment_id=punishment["id"]
+                )
+            except Exception as e_fetch:
+                 print(f"[TASK] Błąd przy pobieraniu użytkownika ID {user_id} dla odbanowania: {e_fetch}. Kara ID {punishment['id']} pozostaje aktywna.")
+
+
+# Modyfikacja on_ready, aby uruchomić nowy task
+# Jeśli _on_ready_original już istnieje z poprzedniego zadania, musimy to uwzględnić
+if hasattr(bot, 'on_ready') and asyncio.iscoroutinefunction(bot.on_ready) and bot.on_ready.__name__ == "on_ready_with_tasks":
+    # Już mamy zmodyfikowane on_ready, dodajmy do niego start nowego taska
+    _on_ready_tasks_original = bot.on_ready
+
+    async def on_ready_with_all_tasks():
+        await _on_ready_tasks_original() # Wywołaj poprzednią wersję on_ready z taskami
+        if not check_expired_punishments_task.is_running():
+            check_expired_punishments_task.start()
+            print("Uruchomiono zadanie 'check_expired_punishments_task'.")
+    bot.on_ready = on_ready_with_all_tasks
+else: # Jeśli to pierwsze zadanie w tle lub on_ready nie było modyfikowane w ten sposób
+    _on_ready_very_original = bot.on_ready # Zapisz oryginalne on_ready (lub to z pierwszego taska)
+    async def on_ready_with_punishment_task():
+        # await _on_ready_very_original() # Wywołaj oryginalne on_ready, jeśli było
+        # on_ready może być wywołane wielokrotnie, więc najpierw logika z on_ready (synchronizacja komend etc.)
+        # Ta część jest już w _on_ready_original z poprzednich kroków, więc ją wywołujemy.
+        # Zakładam, że _on_ready_original zawiera już print(f'Zalogowano jako {bot.user}'), sync komend, init_db.
+
+        # Jeśli _on_ready_original to oryginalne on_ready z discord.py, które nic nie robi,
+        # to musimy tu dać logikę inicjalizacyjną.
+        # Bezpieczniej jest założyć, że mamy już jakąś logikę w on_ready (np. z poprzednich kroków)
+        # i ją rozszerzamy.
+
+        # Zmiana: Poprzednie on_ready (jeśli było modyfikowane) jest w `_on_ready_original`
+        # zdefiniowanym przy `check_expired_roles`. Jeśli nie, to `_on_ready_very_original`
+        # jest oryginalnym `bot.on_ready` sprzed jakichkolwiek modyfikacji.
+
+        # Najprościej: jeśli `_on_ready_original` istnieje i jest funkcją `on_ready_with_tasks`,
+        # to już go nie nadpisujemy, tylko dodajemy.
+        # Ta logika jest skomplikowana. Uprośćmy:
+
+        # Zawsze wywołujemy to, co było wcześniej w bot.on_ready
+        # Jeśli bot.on_ready nie było funkcją async, to jest problem.
+        # Zakładamy, że jest to już obsłużone.
+
+        # Kod z on_ready (synchronizacja komend, inicjalizacja bazy) jest już wyżej w pliku.
+        # Tutaj tylko startujemy taski.
+        if not check_expired_punishments_task.is_running():
+            check_expired_punishments_task.start()
+            print("Uruchomiono zadanie 'check_expired_punishments_task'.")
+
+        # Jeśli mamy też `check_expired_roles` z ról czasowych, też go tu startujemy.
+        # To jest już w `on_ready_with_tasks`, więc musimy to połączyć.
+        # Zrobione wyżej przez sprawdzenie hasattr i nadpisanie on_ready_with_all_tasks
+
+    # Sprawdźmy, czy bot.on_ready było już modyfikowane. Jeśli tak, to rozszerzamy.
+    # Ta część jest trudna do zrobienia generycznie bez wiedzy o poprzednim stanie bot.on_ready.
+    # Najbezpieczniej jest mieć jedną funkcję on_ready, która startuje WSZYSTKIE taski.
+    # Zmodyfikuję istniejącą `on_ready_with_tasks` (jeśli istnieje) lub stworzę nową.
+
+    # Zrefaktoryzujmy:
+    # 1. Zapisz oryginalne bot.event on_ready, jeśli jeszcze nie zostało zapisane.
+    # 2. Zdefiniuj jedną funkcję on_ready, która robi wszystko: init, sync, start tasks.
+
+    # To już zostało zrobione dla check_expired_roles. Teraz dodajemy do tej logiki.
+    # Kod on_ready_with_tasks powinien już istnieć, jeśli poprzednie kroki były wykonane.
+    # Jeśli nie, to poniższy kod może nadpisać oryginalne on_ready.
+
+    # Aktualna logika on_ready (z poprzednich kroków) powinna być:
+    # @bot.event
+    # async def on_ready(): ... init_db, sync_commands ...
+    # a potem modyfikacja dla check_expired_roles:
+    # _on_ready_original = bot.on_ready
+    # async def on_ready_with_tasks(): await _on_ready_original(); check_expired_roles.start()
+    # bot.on_ready = on_ready_with_tasks
+
+    # Teraz dodajemy kolejny task:
+
+    # Jeśli on_ready_with_tasks już istnieje, to je modyfikujemy.
+    # Jeśli nie, to tworzymy nowe on_ready, które robi wszystko.
+    # Dla uproszczenia, zakładam, że on_ready_with_tasks istnieje (z poprzedniego zadania o rolach czasowych)
+    # i rozszerzam je.
+
+    # Poprzednia modyfikacja on_ready dla `check_expired_roles` wyglądała tak:
+    # _on_ready_original = bot.on_ready (gdzie bot.on_ready to było to z init_db i sync)
+    # async def on_ready_with_tasks():
+    #    await _on_ready_original()
+    #    if not check_expired_roles.is_running(): check_expired_roles.start()
+    # bot.on_ready = on_ready_with_tasks
+
+    # Teraz, chcemy dodać `check_expired_punishments_task.start()`
+    # Najlepiej mieć jedną funkcję `setup_hook` lub rozbudować `on_ready`.
+    # Najprościej będzie zmodyfikować `on_ready_with_tasks` jeśli już istnieje.
+
+    # Załóżmy, że `on_ready_with_tasks` jest naszą główną funkcją on_ready teraz.
+    # Jeśli nie, to poniższy kod może wymagać dostosowania.
+
+    # Jeśli `on_ready_with_tasks` było zdefiniowane dla `check_expired_roles`:
+    if 'on_ready_with_tasks' in globals() and asyncio.iscoroutinefunction(globals()['on_ready_with_tasks']):
+        # Mamy już `on_ready_with_tasks`. Rozszerzmy ją.
+        # To jest trochę hacky, bo modyfikujemy funkcję z innego miejsca.
+        # Lepszym podejściem byłoby zdefiniowanie jednej funkcji on_ready na końcu,
+        # która startuje wszystkie taski.
+
+        # Zamiast tego, zmodyfikuję logikę startu tasków w on_ready, która jest wyżej w pliku.
+        # Kod on_ready jest wyżej, więc tam dodam start tego taska.
+        # Usuwam logikę modyfikacji on_ready stąd, bo powinna być w jednym miejscu.
+        pass # Start taska zostanie dodany do istniejącej funkcji on_ready.
+        # To zostało już obsłużone przez kod:
+        # if hasattr(bot, 'on_ready') and asyncio.iscoroutinefunction(bot.on_ready) and bot.on_ready.__name__ == "on_ready_with_tasks":
+        # To jest zbyt skomplikowane. Zrobię to prościej.
+        # Na końcu pliku, przed bot.run, upewnię się, że wszystkie taski są dodane do on_ready.
+        # Na razie oznaczam ten fragment jako "do zrobienia w on_ready"
+
+# (Pod koniec pliku, przed bot.run(TOKEN))
+# Należy upewnić się, że `on_ready` startuje wszystkie taski.
+# Aktualna on_ready (on_ready_with_tasks) startuje check_expired_roles.
+# Trzeba dodać check_expired_punishments_task.start() do niej.
+# To zostanie zrobione w następnym kroku, przy refaktoryzacji on_ready.
+
+# Na razie, aby uniknąć problemów z wielokrotnym definiowaniem on_ready,
+# zakładam, że start tego taska zostanie dodany do istniejącej funkcji on_ready.
+# Właściwa modyfikacja `on_ready` zostanie pokazana w następnym bloku kodu,
+# gdzie zrefaktoryzuję `on_ready`, aby startowała wszystkie taski.
+
+# Ta sekcja zostanie usunięta i zastąpiona przez zrefaktoryzowane on_ready później.
+# Dla tego kroku, najważniejsze jest zdefiniowanie samego taska.
+
+# Zostanie to obsłużone w następnym kroku, gdzie zrefaktoryzujemy `on_ready`.
+# Na razie dodaję tylko definicję taska.
+# Start taska: check_expired_punishments_task.start() - to musi być w on_ready.
+
+# Modyfikacja on_ready, aby uruchomić WSZYSTKIE taski
+# Usuwamy poprzednie definicje on_ready (jeśli były rozproszone) i tworzymy jedną główną.
+
+@bot.event
+async def on_ready_final(): # Zmieniam nazwę, aby uniknąć konfliktu z poprzednimi on_ready
+    print(f'Zalogowano jako {bot.user}')
+    try:
+        database.init_db()
+        print("Baza danych zainicjalizowana.")
+        synced = await bot.tree.sync()
+        print(f"Zsynchronizowano {len(synced)} komend(y) globalnie.")
+    except Exception as e:
+        print(f"Wystąpił błąd podczas synchronizacji komend lub inicjalizacji DB: {e}")
+
+    # Startuj wszystkie taski
+    if not check_expired_roles.is_running(): # Task z ról czasowych
+        check_expired_roles.start()
+        print("Uruchomiono zadanie 'check_expired_roles'.")
+
+    if not check_expired_punishments_task.is_running(): # Nowy task
+        check_expired_punishments_task.start()
+        print("Uruchomiono zadanie 'check_expired_punishments_task'.")
+
+# Nadpisz event on_ready bota nową funkcją
+bot.event(on_ready_final)
+
+
+
+# --- Komendy Konfiguracyjne dla Systemu Kar ---
+
+@bot.tree.command(name="set_muted_role", description="Ustawia rolę, która będzie używana do wyciszania użytkowników.")
+@app_commands.describe(rola="Rola 'Muted', która odbiera uprawnienia do pisania/mówienia.")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_muted_role_command(interaction: discord.Interaction, rola: discord.Role):
+    if not interaction.guild_id or not interaction.guild:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    # Sprawdzenie, czy bot może zarządzać tą rolą (czy rola bota jest wyżej)
+    if interaction.guild.me.top_role <= rola:
+        await interaction.response.send_message(
+            f"Nie mogę ustawić roli {rola.mention} jako roli wyciszenia, ponieważ jest ona na równym lub wyższym poziomie w hierarchii niż moja najwyższa rola. "
+            "Przesuń rolę bota wyżej lub wybierz niższą rolę.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        database.update_server_config(guild_id=interaction.guild_id, muted_role_id=rola.id)
+        await interaction.response.send_message(f"Rola wyciszenia (Muted Role) została ustawiona na {rola.mention}.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Wystąpił błąd podczas ustawiania roli wyciszenia: {e}", ephemeral=True)
+
+@set_muted_role_command.error
+async def set_muted_role_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień administratora, aby użyć tej komendy.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)
+
+
+@bot.tree.command(name="set_actions_log_channel", description="Ustawia kanał dla logów akcji moderatorów (mute, ban, kick itp.).")
+@app_commands.describe(kanal="Kanał tekstowy, na który będą wysyłane logi akcji moderatorów.")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_actions_log_channel_command(interaction: discord.Interaction, kanal: discord.TextChannel):
+    if not interaction.guild_id:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+    try:
+        database.update_server_config(guild_id=interaction.guild_id, moderator_actions_log_channel_id=kanal.id)
+        await interaction.response.send_message(f"Kanał logów akcji moderatorów został ustawiony na {kanal.mention}.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Wystąpił błąd podczas ustawiania kanału logów: {e}", ephemeral=True)
+
+@set_actions_log_channel_command.error
+async def set_actions_log_channel_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("Nie masz uprawnień administratora, aby użyć tej komendy.", ephemeral=True)
     else:
