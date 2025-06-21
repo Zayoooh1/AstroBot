@@ -791,3 +791,442 @@ async def rank_command(interaction: discord.Interaction, uzytkownik: discord.Mem
     # embed.add_field(name="Ranking na serwerze", value="#X (TODO)", inline=True)
 
     await interaction.response.send_message(embed=embed)
+
+# --- System Weryfikacji Quizem ---
+
+@bot.tree.command(name="set_unverified_role", description="Ustawia rolę dla nowych, nieweryfikowanych członków.")
+@app_commands.describe(rola="Rola, którą otrzymają nowi członkowie przed weryfikacją.")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_unverified_role_command(interaction: discord.Interaction, rola: discord.Role):
+    if not interaction.guild_id:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+    try:
+        database.update_server_config(guild_id=interaction.guild_id, unverified_role_id=rola.id)
+        await interaction.response.send_message(f"Rola dla nieweryfikowanych członków została ustawiona na {rola.mention}.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Wystąpił błąd podczas ustawiania roli: {e}", ephemeral=True)
+
+@set_unverified_role_command.error
+async def set_unverified_role_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień administratora, aby użyć tej komendy.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)
+
+# Event dla dołączającego użytkownika - nadanie roli Nieweryfikowany
+@bot.event
+async def on_member_join(member: discord.Member):
+    if member.bot: # Ignoruj inne boty dołączające do serwera
+        return
+
+    guild = member.guild
+    server_config = database.get_server_config(guild.id)
+
+    if server_config and server_config.get("unverified_role_id"):
+        unverified_role_id = server_config["unverified_role_id"]
+        role = guild.get_role(unverified_role_id)
+        if role:
+            try:
+                # Sprawdzenie hierarchii - czy bot może nadać tę rolę
+                if guild.me.top_role > role:
+                    await member.add_roles(role, reason="Automatyczne nadanie roli dla nowych członków.")
+                    print(f"Nadano rolę '{role.name}' nowemu członkowi {member.name} na serwerze {guild.name}.")
+
+                    # Wysłanie wiadomości powitalnej/instrukcji
+                    welcome_message = (
+                        f"Witaj {member.mention} na serwerze **{guild.name}**!\n\n"
+                        "Aby uzyskać pełny dostęp, musisz przejść krótką weryfikację w formie quizu regulaminowego.\n"
+                        "Użyj komendy `/verify_me` tutaj (w DM) lub na dowolnym kanale na serwerze, aby rozpocząć quiz."
+                    )
+                    # Spróbuj wysłać w DM
+                    try:
+                        await member.send(welcome_message)
+                        print(f"Wysłano wiadomość powitalną DM do {member.name}.")
+                    except discord.Forbidden:
+                        print(f"Nie udało się wysłać wiadomości powitalnej DM do {member.name} (zablokowane DM lub brak uprawnień).")
+                        # Można dodać fallback na wysłanie na kanał systemowy serwera, jeśli istnieje i jest skonfigurowany
+                        # np. if guild.system_channel: await guild.system_channel.send(f"Witaj {member.mention}! Użyj /verify_me aby się zweryfikować.")
+                    except Exception as e_dm:
+                        print(f"Inny błąd podczas wysyłania DM do {member.name}: {e_dm}")
+
+                else:
+                    print(f"Błąd (on_member_join): Bot nie może nadać roli '{role.name}' (ID: {unverified_role_id}) użytkownikowi {member.name} na serwerze {guild.name} z powodu niewystarczającej hierarchii roli bota.")
+            except discord.Forbidden:
+                print(f"Błąd (on_member_join): Bot nie ma uprawnień do nadania roli '{role.name}' (ID: {unverified_role_id}) na serwerze {guild.name}.")
+            except Exception as e:
+                print(f"Nieoczekiwany błąd (on_member_join) podczas nadawania roli {member.name} na serwerze {guild.name}: {e}")
+        else:
+            print(f"Błąd (on_member_join): Skonfigurowana rola 'Nieweryfikowany' (ID: {unverified_role_id}) nie została znaleziona na serwerze {guild.name}.")
+    # Jeśli nie ma konfiguracji unverified_role_id, nic nie rób (lub zaloguj ostrzeżenie)
+    # else:
+    #     print(f"Ostrzeżenie (on_member_join): Brak skonfigurowanej roli 'Nieweryfikowany' dla serwera {guild.name}.")
+
+    # Jeśli masz inne zadania do wykonania przy dołączeniu członka, dodaj je tutaj.
+    # Np. jeśli `on_message` przetwarza komendy tekstowe, a nie tylko slash, to nie jest to miejsce na `process_commands`.
+
+# Globalny słownik do śledzenia stanu quizu użytkowników
+# Klucz: user_id, Wartość: {'guild_id': int, 'questions': list, 'current_q_index': int, 'answers': list}
+active_quizzes = {}
+
+@bot.tree.command(name="verify_me", description="Rozpoczyna quiz weryfikacyjny, aby uzyskać dostęp do serwera.")
+async def verify_me_command(interaction: discord.Interaction):
+    if not interaction.guild: # Ta komenda inicjuje proces dla serwera, więc musi być info o guild
+        await interaction.response.send_message(
+            "Proszę, użyj tej komendy na serwerze, którego dotyczy weryfikacja, lub upewnij się, że bot wie, który serwer weryfikujesz.",
+            ephemeral=True
+        )
+        return
+
+    user = interaction.user
+    guild = interaction.guild
+
+    # Sprawdzenie, czy użytkownik jest już zweryfikowany
+    server_config = database.get_server_config(guild.id)
+    if not server_config or not server_config.get("verified_role_id") or not server_config.get("unverified_role_id"):
+        await interaction.response.send_message(
+            "System weryfikacji nie jest w pełni skonfigurowany na tym serwerze. Skontaktuj się z administratorem.",
+            ephemeral=True
+        )
+        return
+
+    verified_role = guild.get_role(server_config["verified_role_id"])
+    unverified_role = guild.get_role(server_config["unverified_role_id"])
+
+    if not verified_role or not unverified_role:
+        await interaction.response.send_message(
+            "Role weryfikacyjne (zweryfikowany/nieweryfikowany) nie są poprawnie skonfigurowane. Skontaktuj się z administratorem.",
+            ephemeral=True
+        )
+        return
+
+    member = guild.get_member(user.id)
+    if not member: # Powinno być, jeśli interakcja z serwera
+        await interaction.response.send_message("Nie mogę Cię znaleźć na tym serwerze.", ephemeral=True)
+        return
+
+    if verified_role in member.roles:
+        await interaction.response.send_message("Jesteś już zweryfikowany/a!", ephemeral=True)
+        return
+
+    if not (unverified_role in member.roles):
+        # Jeśli użytkownik nie ma roli "unverified", a także nie ma "verified", to jest to dziwny stan.
+        # Możemy założyć, że nie potrzebuje weryfikacji, lub że admin powinien to naprawić.
+        # Na razie, jeśli nie ma unverified, a ma inne role, niech admin to sortuje.
+        # Jeśli nie ma unverified i nie ma verified, a są pytania - może zacząć.
+        # Dla uproszczenia: jeśli nie masz roli "unverified", a quiz jest, to coś jest nie tak z setupem.
+        # Ale jeśli nie masz "unverified" I NIE MASZ "verified", to przepuśćmy do quizu.
+         pass # Pozwól kontynuować, jeśli nie ma ani verified, ani unverified.
+
+    if user.id in active_quizzes:
+        await interaction.response.send_message("Masz już aktywny quiz. Sprawdź swoje wiadomości prywatne.", ephemeral=True)
+        return
+
+    questions = database.get_quiz_questions(guild.id)
+    if not questions:
+        await interaction.response.send_message(
+            "Brak pytań w quizie weryfikacyjnym dla tego serwera. Skontaktuj się z administratorem.",
+            ephemeral=True
+        )
+        # Można też automatycznie zweryfikować, jeśli nie ma pytań, a role są ustawione.
+        # Ale to może być niebezpieczne, jeśli admin zapomniał dodać pytań.
+        # Lepiej poczekać na konfigurację.
+        return
+
+    active_quizzes[user.id] = {
+        "guild_id": guild.id,
+        "questions": questions,
+        "current_q_index": 0,
+        "answers": []
+    }
+
+    await interaction.response.send_message("Rozpoczynam quiz weryfikacyjny w Twoich wiadomościach prywatnych (DM). Sprawdź je teraz!", ephemeral=True)
+
+    try:
+        await send_quiz_question_dm(user)
+    except discord.Forbidden:
+        await interaction.followup.send("Nie mogę wysłać Ci wiadomości prywatnej. Upewnij się, że masz włączone DM od członków serwera.", ephemeral=True)
+        del active_quizzes[user.id] # Usuń stan quizu, bo nie można kontynuować
+    except Exception as e:
+        await interaction.followup.send(f"Wystąpił błąd podczas rozpoczynania quizu: {e}", ephemeral=True)
+        if user.id in active_quizzes:
+            del active_quizzes[user.id]
+
+
+async def send_quiz_question_dm(user: discord.User):
+    quiz_state = active_quizzes.get(user.id)
+    if not quiz_state:
+        return # Quiz nie jest już aktywny
+
+    q_index = quiz_state["current_q_index"]
+    if q_index < len(quiz_state["questions"]):
+        question_data = quiz_state["questions"][q_index]
+        try:
+            await user.send(f"**Pytanie {q_index + 1}/{len(quiz_state['questions'])}:**\n{question_data['question']}")
+        except discord.Forbidden:
+            # Jeśli nie można wysłać DM, zakończ quiz dla tego użytkownika
+            guild_id_for_log = quiz_state.get('guild_id', 'Nieznany')
+            print(f"Błąd DM (send_quiz_question_dm): Nie można wysłać pytania do {user.name} (ID: {user.id}) dla serwera {guild_id_for_log}. Kończenie quizu.")
+            if user.id in active_quizzes: del active_quizzes[user.id]
+            # TODO: Można by wysłać wiadomość na serwerze, jeśli to możliwe, że DM są zablokowane.
+        except Exception as e:
+            print(f"Błąd podczas wysyłania pytania DM do {user.name}: {e}")
+            if user.id in active_quizzes: del active_quizzes[user.id]
+    else:
+        # Wszystkie pytania zadane, czas na sprawdzenie
+        await process_quiz_results(user)
+
+
+async def process_quiz_results(user: discord.User):
+    quiz_state = active_quizzes.get(user.id)
+    if not quiz_state:
+        return
+
+    guild_id = quiz_state["guild_id"]
+    guild = bot.get_guild(guild_id)
+    if not guild:
+        print(f"Błąd (process_quiz_results): Nie znaleziono serwera o ID {guild_id} dla użytkownika {user.name}.")
+        if user.id in active_quizzes: del active_quizzes[user.id]
+        return
+
+    member = guild.get_member(user.id)
+    if not member:
+        print(f"Błąd (process_quiz_results): Nie znaleziono członka {user.name} na serwerze {guild.name}.")
+        if user.id in active_quizzes: del active_quizzes[user.id]
+        return
+
+    server_config = database.get_server_config(guild.id)
+    if not server_config or not server_config.get("verified_role_id") or not server_config.get("unverified_role_id"):
+        await user.send("Wystąpił błąd konfiguracyjny na serwerze. Nie można zakończyć weryfikacji.")
+        if user.id in active_quizzes: del active_quizzes[user.id]
+        return
+
+    unverified_role = guild.get_role(server_config["unverified_role_id"])
+    verified_role = guild.get_role(server_config["verified_role_id"])
+
+    if not unverified_role or not verified_role:
+        await user.send("Role weryfikacyjne nie są poprawnie ustawione na serwerze. Skontaktuj się z administratorem.")
+        if user.id in active_quizzes: del active_quizzes[user.id]
+        return
+
+    correct_answers_count = 0
+    for i, question_data in enumerate(quiz_state["questions"]):
+        user_answer = quiz_state["answers"][i].lower().strip()
+        correct_answer = question_data["answer"].lower().strip() # Odpowiedzi w bazie są już małymi literami
+        if user_answer == correct_answer:
+            correct_answers_count += 1
+
+    all_correct = correct_answers_count == len(quiz_state["questions"])
+
+    if all_correct:
+        try:
+            # Sprawdzenie hierarchii przed zmianą ról
+            if guild.me.top_role > verified_role and (guild.me.top_role > unverified_role or unverified_role not in member.roles):
+                if unverified_role in member.roles:
+                    await member.remove_roles(unverified_role, reason="Pomyślna weryfikacja quizem.")
+                await member.add_roles(verified_role, reason="Pomyślna weryfikacja quizem.")
+                await user.send(
+                    f"🎉 Gratulacje! Pomyślnie przeszedłeś/aś quiz weryfikacyjny na serwerze **{guild.name}**!\n"
+                    f"Otrzymałeś/aś rolę {verified_role.mention} i pełny dostęp."
+                )
+                print(f"Użytkownik {member.name} pomyślnie zweryfikowany na serwerze {guild.name}.")
+            else:
+                await user.send(f"Weryfikacja przebiegła pomyślnie, ale nie mogę zarządzać Twoimi rolami (problem z hierarchią ról bota). Skontaktuj się z administratorem serwera **{guild.name}**.")
+                print(f"Problem z hierarchią ról przy weryfikacji {member.name} na {guild.name}.")
+
+        except discord.Forbidden:
+            await user.send(f"Weryfikacja przebiegła pomyślnie, ale nie mam uprawnień do zmiany Twoich ról na serwerze **{guild.name}**. Skontaktuj się z administratorem.")
+            print(f"Problem z uprawnieniami przy weryfikacji {member.name} na {guild.name}.")
+        except Exception as e:
+            await user.send(f"Wystąpił nieoczekiwany błąd podczas finalizacji weryfikacji na serwerze **{guild.name}**. Skontaktuj się z administratorem. Błąd: {e}")
+            print(f"Nieoczekiwany błąd przy weryfikacji {member.name} na {guild.name}: {e}")
+    else:
+        # TODO: Dodać logikę dla niepoprawnych odpowiedzi, np. ile było poprawnych, czy można spróbować ponownie.
+        await user.send(
+            f"Niestety, nie wszystkie Twoje odpowiedzi były poprawne ({correct_answers_count}/{len(quiz_state['questions'])}).\n"
+            "Spróbuj ponownie używając komendy `/verify_me` na serwerze."
+        )
+        print(f"Użytkownik {member.name} nie przeszedł weryfikacji na serwerze {guild.name} ({correct_answers_count}/{len(quiz_state['questions'])}).")
+
+    if user.id in active_quizzes:
+        del active_quizzes[user.id] # Zakończ sesję quizu
+
+
+# Modyfikacja on_message, aby przechwytywać odpowiedzi na quiz w DM
+_on_message_original = bot.on_message
+
+async def on_message_with_quiz(message: discord.Message):
+    # Najpierw wywołaj oryginalną logikę on_message (dla XP, ról za aktywność itp.)
+    # ale tylko jeśli to nie jest DM i nie jest to odpowiedź na quiz
+    if message.guild and not (message.author.id in active_quizzes and isinstance(message.channel, discord.DMChannel)):
+        # To jest nieco skomplikowane, bo oryginalny on_message też ma logikę dla guild
+        # Musimy uważać, żeby nie wywołać go podwójnie lub w złym kontekście.
+        # Na razie załóżmy, że oryginalny on_message jest tylko dla wiadomości na serwerze.
+        # await _on_message_original(message) # To może być problematyczne, jeśli on_message_original ma własne return
+
+        # Zamiast wywoływać cały oryginalny on_message, skopiujmy jego istotną część tutaj,
+        # upewniając się, że nie koliduje z logiką DM quizu.
+
+        # --- Skopiowana logika z on_message dla XP i ról za aktywność ---
+        if message.guild and not message.author.bot: # Upewnij się, że to wiadomość na serwerze
+            # Inkrementacja licznika wiadomości dla ról za aktywność (jeśli ta funkcja jest nadal używana)
+            # database.increment_message_count(message.guild.id, message.author.id)
+            # current_msg_count_for_activity_roles = database.get_user_stats(message.guild.id, message.author.id)['message_count']
+            # eligible_activity_role_data = database.get_highest_eligible_role(message.guild.id, current_msg_count_for_activity_roles)
+            # if eligible_activity_role_data: ... (reszta logiki ról za aktywność) ...
+
+            # Logika XP i Poziomów
+            guild_id = message.guild.id
+            user_id = message.author.id
+            current_time = time.time()
+            user_cooldown_key = (guild_id, user_id)
+            last_gain = last_xp_gain_timestamp.get(user_cooldown_key, 0)
+
+            if current_time - last_gain > leveling.XP_COOLDOWN_SECONDS:
+                xp_to_add = random.randint(leveling.XP_PER_MESSAGE_MIN, leveling.XP_PER_MESSAGE_MAX)
+                new_total_xp = database.add_xp(guild_id, user_id, xp_to_add)
+                last_xp_gain_timestamp[user_cooldown_key] = current_time
+                user_stats_xp = database.get_user_stats(guild_id, user_id)
+                current_level_db_xp = user_stats_xp['level']
+                calculated_level_xp = leveling.get_level_from_xp(new_total_xp)
+                if calculated_level_xp > current_level_db_xp:
+                    database.set_user_level(guild_id, user_id, calculated_level_xp)
+                    try:
+                        await message.channel.send(
+                            f"🎉 Gratulacje {message.author.mention}! Osiągnąłeś/aś **Poziom {calculated_level_xp}**!"
+                        )
+                        print(f"User {message.author.name} leveled up to {calculated_level_xp} on server {message.guild.name}.")
+                    except discord.Forbidden:
+                        print(f"Nie udało się wysłać wiadomości o awansie na kanale {message.channel.name} (brak uprawnień).")
+        # --- Koniec skopiowanej logiki ---
+
+
+    # Logika dla odpowiedzi na quiz w DM
+    if isinstance(message.channel, discord.DMChannel) and message.author.id in active_quizzes and not message.author.bot:
+        user_id = message.author.id
+        quiz_state = active_quizzes[user_id]
+
+        # Sprawdź, czy użytkownik nie próbuje odpowiedzieć na już zakończony quiz (teoretycznie niemożliwe jeśli usuwamy ze słownika)
+        if quiz_state["current_q_index"] >= len(quiz_state["questions"]):
+             # await message.author.send("Quiz został już zakończony lub wystąpił błąd.")
+             return # Nic nie rób, quiz już przetworzony lub w trakcie przetwarzania
+
+        quiz_state["answers"].append(message.content)
+        quiz_state["current_q_index"] += 1
+
+        # Wyślij następne pytanie lub zakończ quiz
+        await send_quiz_question_dm(message.author)
+        return # Ważne, aby nie przetwarzać dalej jako zwykłą wiadomość
+
+    # Jeśli używasz komend tekstowych z prefixem, i nie jest to odpowiedź na quiz DM
+    # if not (isinstance(message.channel, discord.DMChannel) and message.author.id in active_quizzes):
+    #    await bot.process_commands(message)
+
+bot.on_message = on_message_with_quiz # Nadpisz standardowy on_message
+
+
+@bot.tree.command(name="set_verified_role", description="Ustawia rolę nadawaną po pomyślnej weryfikacji quizem.")
+@app_commands.describe(rola="Rola, którą otrzymają członkowie po weryfikacji.")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_verified_role_command(interaction: discord.Interaction, rola: discord.Role):
+    if not interaction.guild_id:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    # Sprawdzenie hierarchii - bot musi móc nadać tę rolę
+    if interaction.guild and interaction.guild.me.top_role <= rola:
+        await interaction.response.send_message(
+            f"Nie mogę ustawić roli {rola.mention} jako roli weryfikacyjnej, ponieważ jest ona na równym lub wyższym poziomie w hierarchii niż moja najwyższa rola. "
+            "Przesuń rolę bota wyżej lub wybierz niższą rolę.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        database.update_server_config(guild_id=interaction.guild_id, verified_role_id=rola.id)
+        await interaction.response.send_message(f"Rola dla zweryfikowanych członków została ustawiona na {rola.mention}.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Wystąpił błąd podczas ustawiania roli: {e}", ephemeral=True)
+
+@set_verified_role_command.error
+async def set_verified_role_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień administratora, aby użyć tej komendy.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)
+
+
+@bot.tree.command(name="add_quiz_question", description="Dodaje pytanie do quizu weryfikacyjnego.")
+@app_commands.describe(pytanie="Treść pytania.", odpowiedz="Poprawna odpowiedź na pytanie (wielkość liter ignorowana).")
+@app_commands.checks.has_permissions(administrator=True)
+async def add_quiz_question_command(interaction: discord.Interaction, pytanie: str, odpowiedz: str):
+    if not interaction.guild_id:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+    try:
+        question_id = database.add_quiz_question(interaction.guild_id, pytanie, odpowiedz.lower()) # Odpowiedzi przechowujemy małymi literami
+        await interaction.response.send_message(f"Dodano pytanie do quizu (ID: {question_id}): \"{pytanie}\" z odpowiedzią \"{odpowiedz}\".", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Wystąpił błąd podczas dodawania pytania: {e}", ephemeral=True)
+
+@add_quiz_question_command.error
+async def add_quiz_question_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień administratora, aby użyć tej komendy.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)
+
+
+@bot.tree.command(name="list_quiz_questions", description="Wyświetla listę pytań quizu weryfikacyjnego.")
+@app_commands.checks.has_permissions(administrator=True)
+async def list_quiz_questions_command(interaction: discord.Interaction):
+    if not interaction.guild_id:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    questions = database.get_quiz_questions(interaction.guild_id)
+    if not questions:
+        await interaction.response.send_message("Brak pytań w quizie dla tego serwera.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title=f"Pytania Quizu Weryfikacyjnego dla {interaction.guild.name}", color=discord.Color.orange())
+    for q in questions:
+        embed.add_field(name=f"ID: {q['id']} - Pytanie:", value=q['question'], inline=False)
+        embed.add_field(name="Odpowiedź:", value=f"||{q['answer']}||", inline=False) # Odpowiedź w spoilerze
+        if len(embed.fields) >= 24 and q != questions[-1]: # Discord limit 25 fields, zostaw miejsce na ostatnie
+             await interaction.followup.send(embed=embed, ephemeral=True) # Wyslij obecny embed i zacznij nowy
+             embed = discord.Embed(title=f"Pytania Quizu (cd.)", color=discord.Color.orange())
+
+    if len(embed.fields) > 0 : # Jeśli coś zostało w ostatnim embedzie
+        await interaction.response.send_message(embed=embed, ephemeral=True) if not interaction.response.is_done() else await interaction.followup.send(embed=embed,ephemeral=True)
+    elif not interaction.response.is_done(): # Jeśli nie było żadnych pól, ale interakcja nie jest zakończona
+        await interaction.response.send_message("Brak pytań do wyświetlenia (pusty embed).", ephemeral=True)
+
+
+@list_quiz_questions_command.error
+async def list_quiz_questions_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień administratora, aby użyć tej komendy.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)
+
+
+@bot.tree.command(name="remove_quiz_question", description="Usuwa pytanie z quizu weryfikacyjnego.")
+@app_commands.describe(id_pytania="ID pytania, które chcesz usunąć (znajdziesz je komendą /list_quiz_questions).")
+@app_commands.checks.has_permissions(administrator=True)
+async def remove_quiz_question_command(interaction: discord.Interaction, id_pytania: int):
+    if not interaction.guild_id:
+        await interaction.response.send_message("Ta komenda może być użyta tylko na serwerze.", ephemeral=True)
+        return
+
+    if database.remove_quiz_question(id_pytania):
+        await interaction.response.send_message(f"Pytanie o ID {id_pytania} zostało usunięte z quizu.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Nie znaleziono pytania o ID {id_pytania} w quizie dla tego serwera.", ephemeral=True)
+
+@remove_quiz_question_command.error
+async def remove_quiz_question_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Nie masz uprawnień administratora, aby użyć tej komendy.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Wystąpił błąd: {error}", ephemeral=True)

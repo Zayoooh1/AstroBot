@@ -42,35 +42,110 @@ def init_db():
         UNIQUE (guild_id, required_message_count)
     )
     """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS quiz_questions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        question TEXT NOT NULL,
+        answer TEXT NOT NULL
+    )
+    """)
     conn.commit()
     conn.close()
 
 if __name__ == '__main__':
     init_db()
-    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity' i 'activity_role_configs'.")
+    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs' i 'quiz_questions'.")
 
-def update_server_config(guild_id: int, welcome_message_content: str = None, reaction_role_id: int = None, reaction_message_id: int = None):
+def update_server_config(guild_id: int, welcome_message_content: str = None,
+                         reaction_role_id: int = None, reaction_message_id: int = None,
+                         unverified_role_id: int = None, verified_role_id: int = None):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+    # Ensure the server_configs row exists
     cursor.execute("INSERT OR IGNORE INTO server_configs (guild_id) VALUES (?)", (guild_id,))
+
+    updates = []
+    params = []
+
     if welcome_message_content is not None:
-        cursor.execute("UPDATE server_configs SET welcome_message_content = ? WHERE guild_id = ?", (welcome_message_content, guild_id))
+        updates.append("welcome_message_content = ?")
+        params.append(welcome_message_content)
     if reaction_role_id is not None:
-        cursor.execute("UPDATE server_configs SET reaction_role_id = ? WHERE guild_id = ?", (reaction_role_id, guild_id))
+        updates.append("reaction_role_id = ?")
+        params.append(reaction_role_id)
     if reaction_message_id is not None:
-        cursor.execute("UPDATE server_configs SET reaction_message_id = ? WHERE guild_id = ?", (reaction_message_id, guild_id))
+        updates.append("reaction_message_id = ?")
+        params.append(reaction_message_id)
+    if unverified_role_id is not None:
+        updates.append("unverified_role_id = ?")
+        params.append(unverified_role_id)
+    if verified_role_id is not None:
+        updates.append("verified_role_id = ?")
+        params.append(verified_role_id)
+
+    if updates:
+        sql = f"UPDATE server_configs SET {', '.join(updates)} WHERE guild_id = ?"
+        params.append(guild_id)
+        cursor.execute(sql, tuple(params))
+
     conn.commit()
     conn.close()
 
 def get_server_config(guild_id: int):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT welcome_message_content, reaction_role_id, reaction_message_id FROM server_configs WHERE guild_id = ?", (guild_id,))
+    # Ensure all columns are selected, even if they were added later to an existing DB
+    # This requires knowing all columns. A better way might be PRAGMA table_info and dynamic select
+    # For now, let's list them assuming they might be NULL
+    cursor.execute("""
+        SELECT welcome_message_content, reaction_role_id, reaction_message_id,
+               unverified_role_id, verified_role_id
+        FROM server_configs
+        WHERE guild_id = ?
+        """, (guild_id,))
     row = cursor.fetchone()
     conn.close()
     if row:
-        return {"welcome_message_content": row[0], "reaction_role_id": row[1], "reaction_message_id": row[2]}
+        return {
+            "welcome_message_content": row[0],
+            "reaction_role_id": row[1],
+            "reaction_message_id": row[2],
+            "unverified_role_id": row[3],
+            "verified_role_id": row[4]
+        }
     return None
+
+# --- Funkcje dla Quizu Weryfikacyjnego ---
+
+def add_quiz_question(guild_id: int, question: str, answer: str) -> int:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO quiz_questions (guild_id, question, answer)
+    VALUES (?, ?, ?)
+    """, (guild_id, question, answer))
+    question_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return question_id
+
+def remove_quiz_question(question_id: int) -> bool:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM quiz_questions WHERE id = ?", (question_id,))
+    deleted_rows = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return deleted_rows > 0
+
+def get_quiz_questions(guild_id: int) -> list[dict]:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, question, answer FROM quiz_questions WHERE guild_id = ?", (guild_id,))
+    questions = [{"id": row[0], "question": row[1], "answer": row[2]} for row in cursor.fetchall()]
+    conn.close()
+    return questions
 
 # Funkcje CRUD dla timed_roles
 
