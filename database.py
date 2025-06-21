@@ -1,12 +1,14 @@
 import sqlite3
 import time
-import json # Dodano import json
+import json
 
 DB_NAME = 'bot_config.db'
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+
+    # server_configs
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS server_configs (
         guild_id INTEGER PRIMARY KEY,
@@ -20,9 +22,18 @@ def init_db():
         filter_spam_enabled BOOLEAN DEFAULT TRUE,
         filter_invites_enabled BOOLEAN DEFAULT TRUE,
         muted_role_id INTEGER,
-        moderator_actions_log_channel_id INTEGER
+        moderator_actions_log_channel_id INTEGER,
+        custom_command_prefix TEXT DEFAULT '!',
+        ticket_category_id INTEGER,
+        ticket_log_channel_id INTEGER,
+        ticket_support_role_ids_json TEXT DEFAULT '[]',
+        feedback_channel_id INTEGER,
+        product_report_channel_id INTEGER,
+        product_report_time_utc TEXT
     )
     """)
+
+    # timed_roles
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS timed_roles (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,6 +43,10 @@ def init_db():
         expiration_timestamp INTEGER NOT NULL
     )
     """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_timed_roles_guild_user_role ON timed_roles (guild_id, user_id, role_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_timed_roles_expiration ON timed_roles (expiration_timestamp)")
+
+    # user_activity - UPEWNIJ SIĘ, ŻE SĄ TU xp I level
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS user_activity (
         guild_id INTEGER NOT NULL,
@@ -42,6 +57,9 @@ def init_db():
         PRIMARY KEY (guild_id, user_id)
     )
     """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_activity_xp_level ON user_activity (guild_id, xp DESC, level DESC)")
+
+    # activity_role_configs
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS activity_role_configs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,6 +70,9 @@ def init_db():
         UNIQUE (guild_id, required_message_count)
     )
     """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_role_configs_guild_req_count ON activity_role_configs (guild_id, required_message_count)")
+
+    # quiz_questions
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS quiz_questions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,6 +81,9 @@ def init_db():
         answer TEXT NOT NULL
     )
     """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_quiz_questions_guild ON quiz_questions (guild_id)")
+
+    # banned_words
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS banned_words (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,6 +92,8 @@ def init_db():
         UNIQUE (guild_id, word)
     )
     """)
+
+    # punishments
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS punishments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,9 +107,10 @@ def init_db():
         created_at INTEGER NOT NULL
     )
     """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_punishments_user_guild ON punishments (user_id, guild_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_punishments_expires_active ON punishments (expires_at, active)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_punishments_guild_user_created ON punishments (guild_id, user_id, created_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_punishments_type_active_expires ON punishments (type, active, expires_at)")
 
+    # level_rewards
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS level_rewards (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,6 +123,7 @@ def init_db():
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_level_rewards_guild_level ON level_rewards (guild_id, level)")
 
+    # polls
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS polls (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,7 +139,9 @@ def init_db():
     )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_polls_guild_active_ends ON polls (guild_id, is_active, ends_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_polls_message_id ON polls (message_id)")
 
+    # poll_options
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS poll_options (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,6 +153,7 @@ def init_db():
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_poll_options_poll_id ON poll_options (poll_id)")
 
+    # giveaways
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS giveaways (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,7 +172,9 @@ def init_db():
     )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_giveaways_guild_active_ends ON giveaways (guild_id, is_active, ends_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_giveaways_message_id ON giveaways (message_id)")
 
+    # custom_commands
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS custom_commands (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,6 +191,7 @@ def init_db():
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_custom_commands_guild_name ON custom_commands (guild_id, command_name)")
 
+    # tickets
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS tickets (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,30 +208,32 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_tickets_guild_user_open ON tickets (guild_id, user_id, is_open)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_tickets_channel_id ON tickets (channel_id)")
 
+    # tracked_creators
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS tracked_creators (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         guild_id INTEGER NOT NULL,
         platform TEXT NOT NULL CHECK(platform IN ('twitch', 'youtube')),
-        creator_identifier TEXT NOT NULL, -- Nazwa kanału Twitch, ID kanału YouTube
+        creator_identifier TEXT NOT NULL,
         discord_channel_id INTEGER NOT NULL,
         custom_notification_message TEXT,
-        last_notified_id TEXT,            -- ID ostatniego streama/video
+        last_notified_id TEXT,
         last_checked_at INTEGER,
         UNIQUE (guild_id, platform, creator_identifier, discord_channel_id)
     )
     """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracked_creators_guild_platform ON tracked_creators (guild_id, platform)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracked_creators_guild_platform_checked ON tracked_creators (guild_id, platform, last_checked_at)")
 
+    # watched_products
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS watched_products (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        guild_id INTEGER, -- Może być NULL jeśli produkt jest globalny dla bota, lub ID serwera jeśli per-serwer
+        guild_id INTEGER,
         user_id_who_added INTEGER NOT NULL,
         product_url TEXT NOT NULL UNIQUE,
         shop_name TEXT NOT NULL,
         product_name TEXT,
-        last_known_price_str TEXT,
+        last_known_price_cents INTEGER,
         last_known_availability_str TEXT,
         last_scanned_at INTEGER,
         is_active BOOLEAN DEFAULT TRUE
@@ -206,12 +242,13 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_watched_products_url ON watched_products (product_url)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_watched_products_active_shop ON watched_products (is_active, shop_name)")
 
+    # price_history
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS price_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         watched_product_id INTEGER NOT NULL,
         scan_date INTEGER NOT NULL,
-        price_str TEXT,
+        price_cents INTEGER,
         availability_str TEXT,
         FOREIGN KEY(watched_product_id) REFERENCES watched_products(id) ON DELETE CASCADE
     )
@@ -223,8 +260,9 @@ def init_db():
 
 if __name__ == '__main__':
     init_db()
-    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs', 'quiz_questions', 'banned_words', 'punishments', 'level_rewards', 'polls', 'poll_options', 'giveaways', 'custom_commands', 'tickets', 'tracked_creators', 'watched_products' i 'price_history'.")
+    print(f"Baza danych '{DB_NAME}' zainicjalizowana ze wszystkimi tabelami i zaktualizowanymi indeksami.")
 
+# --- Funkcje Konfiguracji Serwera ---
 def update_server_config(guild_id: int, welcome_message_content: str = None,
                          reaction_role_id: int = None, reaction_message_id: int = None,
                          unverified_role_id: int = None, verified_role_id: int = None,
@@ -240,9 +278,8 @@ def update_server_config(guild_id: int, welcome_message_content: str = None,
                          ticket_support_role_ids_json: str = None,
                          feedback_channel_id: int = None,
                          product_report_channel_id: int = None,
-                         product_report_time_utc: str = None # Format "HH:MM"
+                         product_report_time_utc: str = None
                          ):
-    import json # Potrzebne do serializacji/deserializacji listy ID ról
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("INSERT OR IGNORE INTO server_configs (guild_id) VALUES (?)", (guild_id,))
@@ -253,10 +290,12 @@ def update_server_config(guild_id: int, welcome_message_content: str = None,
     def add_update(field_name, value):
         if value is not None:
             updates.append(f"{field_name} = ?")
-            params.append(value)
+            if isinstance(value, bool): params.append(1 if value else 0)
+            else: params.append(value)
 
     add_update("welcome_message_content", welcome_message_content)
     add_update("reaction_role_id", reaction_role_id)
+    # ... (reszta add_update dla wszystkich pól server_configs) ...
     add_update("reaction_message_id", reaction_message_id)
     add_update("unverified_role_id", unverified_role_id)
     add_update("verified_role_id", verified_role_id)
@@ -282,13 +321,26 @@ def update_server_config(guild_id: int, welcome_message_content: str = None,
     conn.commit()
     conn.close()
 
-def get_server_config(guild_id: int):
+def get_server_config(guild_id: int) -> dict | None:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("PRAGMA table_info(server_configs)")
-    available_columns = [row[1] for row in cursor.fetchall()]
+    cursor.execute("SELECT * FROM server_configs WHERE guild_id = ?", (guild_id,))
+    row = cursor.fetchone()
+
+    if not row:
+        conn.close()
+        # Jeśli nie ma konfiguracji, stwórz domyślną i ją zwróć
+        # update_server_config(guild_id) # To stworzy wiersz z samymi NULLami, które all_config_keys obsłuży
+        # Lepiej zwrócić None, a komendy same zdecydują co robić (np. prosić o konfigurację)
+        return None
+
+    # Pobierz nazwy kolumn z opisu kursora po wykonaniu zapytania
+    column_names = [description[0] for description in cursor.description]
+    fetched_data = dict(zip(column_names, row))
+    conn.close()
 
     all_config_keys = {
+        "guild_id": guild_id,
         "welcome_message_content": None, "reaction_role_id": None, "reaction_message_id": None,
         "unverified_role_id": None, "verified_role_id": None,
         "moderation_log_channel_id": None,
@@ -297,39 +349,23 @@ def get_server_config(guild_id: int):
         "custom_command_prefix": "!",
         "ticket_category_id": None, "ticket_log_channel_id": None, "ticket_support_role_ids_json": "[]",
         "feedback_channel_id": None,
-        "product_report_channel_id": None, "product_report_time_utc": None # Domyślnie None
+        "product_report_channel_id": None, "product_report_time_utc": None
     }
 
-    select_cols_str = ", ".join([key for key in all_config_keys if key in available_columns])
-    if not select_cols_str:
-        conn.close()
-        cursor.execute(f"SELECT guild_id FROM server_configs WHERE guild_id = ?", (guild_id,))
-        if not cursor.fetchone():
-            conn.close()
-            return None
-        # Jeśli wiersz istnieje, ale nie ma żadnych pasujących kolumn (bardzo mało prawdopodobne)
-        return all_config_keys
-
-
-    cursor.execute(f"SELECT {select_cols_str} FROM server_configs WHERE guild_id = ?", (guild_id,))
-    row_values = cursor.fetchone()
-
-    if not row_values: # Nie ma wpisu dla tego guild_id
-        conn.close()
-        return None
-
+    # Uzupełnij wynik wartościami z bazy, zachowując domyślne jeśli czegoś brakuje
     config_result = all_config_keys.copy()
-    fetched_data = dict(zip([key for key in all_config_keys if key in available_columns], row_values))
-    for key, value in fetched_data.items():
-        if key in ["filter_profanity_enabled", "filter_spam_enabled", "filter_invites_enabled"]:
-            config_result[key] = bool(value) if value is not None else all_config_keys[key]
-        else:
-            config_result[key] = value if value is not None else all_config_keys[key]
-    conn.close()
+    for key in all_config_keys:
+        if key in fetched_data and fetched_data[key] is not None:
+            if key in ["filter_profanity_enabled", "filter_spam_enabled", "filter_invites_enabled"]:
+                config_result[key] = bool(fetched_data[key])
+            elif key == "ticket_support_role_ids_json" and not fetched_data[key]: # Jeśli jest pusty string zamiast NULL
+                 config_result[key] = "[]"
+            else:
+                config_result[key] = fetched_data[key]
     return config_result
 
-
 # --- Funkcje dla Systemu Kar (Punishments) ---
+# ... (reszta funkcji bez zmian, zakładając, że są poprawne) ...
 def add_punishment(guild_id: int, user_id: int, moderator_id: int,
                    punishment_type: str, reason: str | None, expires_at: int | None = None) -> int:
     conn = sqlite3.connect(DB_NAME)
@@ -391,13 +427,8 @@ def get_user_punishments(guild_id: int, user_id: int) -> list[dict]:
     cases = []
     for row in cursor.fetchall():
         cases.append({
-            "id": row[0],
-            "moderator_id": row[1],
-            "type": row[2],
-            "reason": row[3],
-            "expires_at": row[4],
-            "active": bool(row[5]),
-            "created_at": row[6]
+            "id": row[0], "moderator_id": row[1], "type": row[2], "reason": row[3],
+            "expires_at": row[4], "active": bool(row[5]), "created_at": row[6]
         })
     conn.close()
     return cases
@@ -410,10 +441,8 @@ def add_banned_word(guild_id: int, word: str) -> bool:
         cursor.execute("INSERT INTO banned_words (guild_id, word) VALUES (?, ?)", (guild_id, word.lower()))
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
-        return False
-    finally:
-        conn.close()
+    except sqlite3.IntegrityError: return False
+    finally: conn.close()
 
 def remove_banned_word(guild_id: int, word: str) -> bool:
     conn = sqlite3.connect(DB_NAME)
@@ -436,10 +465,7 @@ def get_banned_words(guild_id: int) -> list[str]:
 def add_quiz_question(guild_id: int, question: str, answer: str) -> int:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    INSERT INTO quiz_questions (guild_id, question, answer)
-    VALUES (?, ?, ?)
-    """, (guild_id, question, answer))
+    cursor.execute("INSERT INTO quiz_questions (guild_id, question, answer) VALUES (?, ?, ?)", (guild_id, question, answer))
     question_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -466,20 +492,14 @@ def get_quiz_questions(guild_id: int) -> list[dict]:
 def add_timed_role(guild_id: int, user_id: int, role_id: int, expiration_timestamp: int):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    INSERT INTO timed_roles (guild_id, user_id, role_id, expiration_timestamp)
-    VALUES (?, ?, ?, ?)
-    """, (guild_id, user_id, role_id, expiration_timestamp))
+    cursor.execute("INSERT INTO timed_roles (guild_id, user_id, role_id, expiration_timestamp) VALUES (?, ?, ?, ?)", (guild_id, user_id, role_id, expiration_timestamp))
     conn.commit()
     conn.close()
 
 def get_expired_roles(current_timestamp: int) -> list[tuple[int, int, int, int, int]]:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    SELECT id, guild_id, user_id, role_id, expiration_timestamp FROM timed_roles
-    WHERE expiration_timestamp <= ?
-    """, (current_timestamp,))
+    cursor.execute("SELECT id, guild_id, user_id, role_id, expiration_timestamp FROM timed_roles WHERE expiration_timestamp <= ?", (current_timestamp,))
     expired_roles = cursor.fetchall()
     conn.close()
     return expired_roles
@@ -494,24 +514,17 @@ def remove_timed_role(timed_role_id: int):
 def get_active_timed_role(guild_id: int, user_id: int, role_id: int):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    SELECT id, expiration_timestamp FROM timed_roles
-    WHERE guild_id = ? AND user_id = ? AND role_id = ? AND expiration_timestamp > strftime('%s', 'now')
-    """, (guild_id, user_id, role_id))
+    cursor.execute("SELECT id, expiration_timestamp FROM timed_roles WHERE guild_id = ? AND user_id = ? AND role_id = ? AND expiration_timestamp > strftime('%s', 'now')", (guild_id, user_id, role_id))
     row = cursor.fetchone()
     conn.close()
-    if row:
-        return {"id": row[0], "expiration_timestamp": row[1]}
+    if row: return {"id": row[0], "expiration_timestamp": row[1]}
     return None
 
 # --- Funkcje dla Aktywności Użytkownika (Wiadomości, XP, Poziomy) ---
 def ensure_user_activity_entry(guild_id: int, user_id: int):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    INSERT OR IGNORE INTO user_activity (guild_id, user_id, message_count, xp, level)
-    VALUES (?, ?, 0, 0, 0)
-    """, (guild_id, user_id))
+    cursor.execute("INSERT OR IGNORE INTO user_activity (guild_id, user_id, message_count, xp, level) VALUES (?, ?, 0, 0, 0)", (guild_id, user_id))
     conn.commit()
     conn.close()
 
@@ -519,11 +532,7 @@ def increment_message_count(guild_id: int, user_id: int):
     ensure_user_activity_entry(guild_id, user_id)
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    UPDATE user_activity
-    SET message_count = message_count + 1
-    WHERE guild_id = ? AND user_id = ?
-    """, (guild_id, user_id))
+    cursor.execute("UPDATE user_activity SET message_count = message_count + 1 WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
     conn.commit()
     conn.close()
 
@@ -531,13 +540,8 @@ def add_xp(guild_id: int, user_id: int, xp_amount: int) -> int:
     ensure_user_activity_entry(guild_id, user_id)
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    UPDATE user_activity
-    SET xp = xp + ?
-    WHERE guild_id = ? AND user_id = ?
-    """, (xp_amount, guild_id, user_id))
+    cursor.execute("UPDATE user_activity SET xp = xp + ? WHERE guild_id = ? AND user_id = ?", (xp_amount, guild_id, user_id))
     conn.commit()
-
     cursor.execute("SELECT xp FROM user_activity WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
     new_total_xp = cursor.fetchone()[0]
     conn.close()
@@ -550,19 +554,14 @@ def get_user_stats(guild_id: int, user_id: int) -> dict:
     cursor.execute("SELECT message_count, xp, level FROM user_activity WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
     row = cursor.fetchone()
     conn.close()
-    if row:
-        return {"message_count": row[0], "xp": row[1], "level": row[2]}
+    if row: return {"message_count": row[0], "xp": row[1], "level": row[2]}
     return {"message_count": 0, "xp": 0, "level": 0}
 
 def set_user_level(guild_id: int, user_id: int, new_level: int):
     ensure_user_activity_entry(guild_id, user_id)
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    UPDATE user_activity
-    SET level = ?
-    WHERE guild_id = ? AND user_id = ?
-    """, (new_level, guild_id, user_id))
+    cursor.execute("UPDATE user_activity SET level = ? WHERE guild_id = ? AND user_id = ?", (new_level, guild_id, user_id))
     conn.commit()
     conn.close()
 
@@ -571,16 +570,10 @@ def add_activity_role_config(guild_id: int, role_id: int, required_message_count
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     try:
-        cursor.execute("""
-        INSERT INTO activity_role_configs (guild_id, role_id, required_message_count)
-        VALUES (?, ?, ?)
-        """, (guild_id, role_id, required_message_count))
+        cursor.execute("INSERT INTO activity_role_configs (guild_id, role_id, required_message_count) VALUES (?, ?, ?)", (guild_id, role_id, required_message_count))
         conn.commit()
-    except sqlite3.IntegrityError as e:
-        conn.rollback()
-        raise e
-    finally:
-        conn.close()
+    except sqlite3.IntegrityError as e: conn.rollback(); raise e
+    finally: conn.close()
 
 def remove_activity_role_config(guild_id: int, role_id: int):
     conn = sqlite3.connect(DB_NAME)
@@ -594,10 +587,7 @@ def remove_activity_role_config(guild_id: int, role_id: int):
 def get_activity_role_configs(guild_id: int) -> list[dict]:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    SELECT role_id, required_message_count FROM activity_role_configs
-    WHERE guild_id = ? ORDER BY required_message_count ASC
-    """, (guild_id,))
+    cursor.execute("SELECT role_id, required_message_count FROM activity_role_configs WHERE guild_id = ? ORDER BY required_message_count ASC", (guild_id,))
     configs = [{"role_id": row[0], "required_message_count": row[1]} for row in cursor.fetchall()]
     conn.close()
     return configs
@@ -606,31 +596,22 @@ def get_highest_eligible_role(guild_id: int, current_message_count: int) -> dict
     configs = get_activity_role_configs(guild_id)
     eligible_role = None
     for config in configs:
-        if current_message_count >= config["required_message_count"]:
-            eligible_role = config
-        else:
-            break
+        if current_message_count >= config["required_message_count"]: eligible_role = config
+        else: break
     return eligible_role
 
 # --- Funkcje dla Nagród za Poziomy (Level Rewards) ---
 def add_level_reward(guild_id: int, level: int, role_id: int = None, message: str = None) -> int | None:
-    if role_id is None and message is None:
-        return None
+    if role_id is None and message is None: return None
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     try:
-        cursor.execute("""
-        INSERT INTO level_rewards (guild_id, level, role_id_to_grant, custom_message_on_level_up)
-        VALUES (?, ?, ?, ?)
-        """, (guild_id, level, role_id, message))
+        cursor.execute("INSERT INTO level_rewards (guild_id, level, role_id_to_grant, custom_message_on_level_up) VALUES (?, ?, ?, ?)", (guild_id, level, role_id, message))
         reward_id = cursor.lastrowid
         conn.commit()
         return reward_id
-    except sqlite3.IntegrityError:
-        conn.rollback()
-        return None
-    finally:
-        conn.close()
+    except sqlite3.IntegrityError: conn.rollback(); return None
+    finally: conn.close()
 
 def remove_level_reward(reward_id: int) -> bool:
     conn = sqlite3.connect(DB_NAME)
@@ -644,31 +625,16 @@ def remove_level_reward(reward_id: int) -> bool:
 def get_rewards_for_level(guild_id: int, level: int) -> list[dict]:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    SELECT id, role_id_to_grant, custom_message_on_level_up
-    FROM level_rewards
-    WHERE guild_id = ? AND level = ?
-    """, (guild_id, level))
-    rewards = [
-        {"id": row[0], "role_id_to_grant": row[1], "custom_message_on_level_up": row[2]}
-        for row in cursor.fetchall()
-    ]
+    cursor.execute("SELECT id, role_id_to_grant, custom_message_on_level_up FROM level_rewards WHERE guild_id = ? AND level = ?", (guild_id, level))
+    rewards = [{"id": row[0], "role_id_to_grant": row[1], "custom_message_on_level_up": row[2]} for row in cursor.fetchall()]
     conn.close()
     return rewards
 
 def get_all_level_rewards_config(guild_id: int) -> list[dict]:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    SELECT id, level, role_id_to_grant, custom_message_on_level_up
-    FROM level_rewards
-    WHERE guild_id = ?
-    ORDER BY level ASC
-    """, (guild_id,))
-    configs = [
-        {"id": row[0], "level": row[1], "role_id_to_grant": row[2], "custom_message_on_level_up": row[3]}
-        for row in cursor.fetchall()
-    ]
+    cursor.execute("SELECT id, level, role_id_to_grant, custom_message_on_level_up FROM level_rewards WHERE guild_id = ? ORDER BY level ASC", (guild_id,))
+    configs = [{"id": row[0], "level": row[1], "role_id_to_grant": row[2], "custom_message_on_level_up": row[3]} for row in cursor.fetchall()]
     conn.close()
     return configs
 
@@ -676,17 +642,8 @@ def get_all_level_rewards_config(guild_id: int) -> list[dict]:
 def get_server_leaderboard(guild_id: int, limit: int = 10, offset: int = 0) -> list[dict]:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    SELECT user_id, xp, level
-    FROM user_activity
-    WHERE guild_id = ? AND xp > 0
-    ORDER BY xp DESC, level DESC
-    LIMIT ? OFFSET ?
-    """, (guild_id, limit, offset))
-    leaderboard = [
-        {"user_id": row[0], "xp": row[1], "level": row[2]}
-        for row in cursor.fetchall()
-    ]
+    cursor.execute("SELECT user_id, xp, level FROM user_activity WHERE guild_id = ? AND xp > 0 ORDER BY xp DESC, level DESC LIMIT ? OFFSET ?", (guild_id, limit, offset))
+    leaderboard = [{"user_id": row[0], "xp": row[1], "level": row[2]} for row in cursor.fetchall()]
     conn.close()
     return leaderboard
 
@@ -695,318 +652,19 @@ def get_user_rank_in_server(guild_id: int, user_id: int) -> tuple[int, int] | No
     cursor = conn.cursor()
     cursor.execute("SELECT xp FROM user_activity WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
     user_xp_row = cursor.fetchone()
-    if not user_xp_row or user_xp_row[0] == 0:
-        conn.close()
-        return None
-
-    cursor.execute("""
-    SELECT user_id FROM user_activity
-    WHERE guild_id = ? AND xp > 0
-    ORDER BY xp DESC, level DESC, user_id ASC
-    """, (guild_id,))
-
+    if not user_xp_row or user_xp_row[0] == 0: conn.close(); return None
+    cursor.execute("SELECT user_id FROM user_activity WHERE guild_id = ? AND xp > 0 ORDER BY xp DESC, level DESC, user_id ASC ", (guild_id,))
     ranked_users = [row[0] for row in cursor.fetchall()]
     total_ranked_players = len(ranked_users)
-
-    try:
-        rank = ranked_users.index(user_id) + 1
-        conn.close()
-        return rank, total_ranked_players
-    except ValueError:
-        conn.close()
-        return None
-
-# --- Funkcje dla Raportów Produktowych ---
-
-def get_all_guilds_with_product_report_config() -> list[dict]:
-    """Pobiera listę ID serwerów i ich konfiguracji raportów produktowych."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    # Upewniamy się, że kolumny istnieją, zanim ich zażądamy
-    cursor.execute("PRAGMA table_info(server_configs)")
-    columns = [row[1] for row in cursor.fetchall()]
-
-    required_cols = ["guild_id", "product_report_channel_id", "product_report_time_utc"]
-    if not all(col in columns for col in required_cols):
-        # Jeśli którejś z kluczowych kolumn brakuje, nie możemy kontynuować dla tej funkcji
-        print("Ostrzeżenie: Brak wymaganych kolumn w server_configs dla raportów produktowych (product_report_channel_id, product_report_time_utc).")
-        conn.close()
-        return []
-
-    cursor.execute("""
-    SELECT guild_id, product_report_channel_id, product_report_time_utc
-    FROM server_configs
-    WHERE product_report_channel_id IS NOT NULL AND product_report_time_utc IS NOT NULL
-    """)
-    configs = [
-        {"guild_id": row[0], "report_channel_id": row[1], "report_time_utc": row[2]}
-        for row in cursor.fetchall()
-    ]
-    conn.close()
-    return configs
-
-def get_product_changes_for_report(guild_id: int, hours_ago: int = 24) -> list[dict]:
-    """
-    Pobiera produkty, których cena lub dostępność zmieniła się w ciągu ostatnich X godzin.
-    Zwraca listę słowników, każdy z 'product_url', 'product_name',
-    'old_price_str', 'new_price_str', 'old_availability_str', 'new_availability_str'.
-    To jest uproszczone, wymagałoby bardziej zaawansowanego śledzenia historii.
-    Na razie zaimplementujemy prostszą wersję: produkty, które były skanowane
-    w ciągu ostatnich X godzin i których obecna cena/dostępność różni się od poprzedniej historycznej.
-    """
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    timestamp_limit = int(time.time()) - (hours_ago * 3600)
-
-    # To zapytanie jest dość skomplikowane i może wymagać optymalizacji lub innego podejścia
-    # dla dużych zbiorów danych. Na razie jest to koncepcja.
-    # Znajdź produkty, które miały zmianę ceny lub dostępności porównując ostatnie dwa wpisy w historii
-    # lub ostatni wpis z obecnym stanem, jeśli ostatni wpis jest wystarczająco stary.
-    # Uproszczenie: weźmy wszystkie produkty i ich ostatnie dwa wpisy w historii (jeśli istnieją)
-    # i porównajmy je w kodzie Pythona. To mniej wydajne dla bazy, ale łatwiejsze do napisania na szybko.
-
-    cursor.execute("""
-        SELECT
-            wp.id, wp.product_url, wp.product_name,
-            wp.last_known_price_str AS current_price,
-            wp.last_known_availability_str AS current_availability,
-            (SELECT ph.price_str FROM price_history ph
-             WHERE ph.watched_product_id = wp.id ORDER BY ph.scan_date DESC LIMIT 1 OFFSET 1) AS prev_price,
-            (SELECT ph.availability_str FROM price_history ph
-             WHERE ph.watched_product_id = wp.id ORDER BY ph.scan_date DESC LIMIT 1 OFFSET 1) AS prev_availability,
-            (SELECT ph.scan_date FROM price_history ph
-             WHERE ph.watched_product_id = wp.id ORDER BY ph.scan_date DESC LIMIT 1 OFFSET 0) AS last_scan_date_in_history
-        FROM watched_products wp
-        WHERE wp.guild_id = ? AND wp.is_active = TRUE
-              AND wp.last_scanned_at >= ?
-              AND (wp.last_known_price_str IS NOT NULL OR wp.last_known_availability_str IS NOT NULL)
-    """, (guild_id, timestamp_limit))
-
-    changes = []
-    for row in cursor.fetchall():
-        product_id, url, name, curr_price, curr_avail, prev_price, prev_avail, last_hist_scan = row
-
-        # Jeśli nie ma poprzedniego wpisu w historii, bierzemy tylko te, które mają co najmniej dwa skany.
-        # Lub jeśli chcemy porównać z pierwszym skanem, to inna logika.
-        # Na razie, jeśli prev_price/prev_avail jest None, to znaczy, że to może być nowy produkt lub tylko jeden skan.
-
-        changed = False
-        if curr_price != prev_price and prev_price is not None : # Sprawdzamy None, bo może nie być poprzedniego wpisu
-            changed = True
-        if curr_avail != prev_avail and prev_avail is not None :
-            changed = True
-
-        if changed:
-            changes.append({
-                "product_url": url, "product_name": name or "Nieznana nazwa",
-                "old_price_str": prev_price, "new_price_str": curr_price,
-                "old_availability_str": prev_avail, "new_availability_str": curr_avail,
-                "last_scan_date_in_history": last_hist_scan # Data ostatniego wpisu w historii (tego "nowego")
-            })
-
-    conn.close()
-    return changes
-
-
-def get_top_price_drops(guild_id: int, hours_ago: int = 24, limit: int = 5) -> list[dict]:
-    """
-    Pobiera top X produktów z największym spadkiem ceny (procentowym lub kwotowym).
-    To również jest uproszczone i wymagałoby dokładniejszej analizy historii.
-    Na razie: znajdź produkty, których cena spadła w ostatnim skanowaniu w porównaniu do przedostatniego.
-    """
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    timestamp_limit = int(time.time()) - (hours_ago * 3600)
-
-    # To zapytanie jest koncepcyjne. Wymagałoby przechowywania cen jako liczb do łatwego porównania.
-    # Ponieważ ceny są stringami, porównanie i obliczenie różnicy w SQL jest trudne.
-    # Zrobimy to w Pythonie po pobraniu danych.
-
-    # Pobierz produkty, które miały co najmniej dwa wpisy w historii w ciągu ostatnich X godzin
-    # i których obecna cena jest niższa niż poprzednia.
-    # To jest bardzo nieefektywne. Lepsze byłoby obliczenie różnicy w Pythonie
-    # po pobraniu wszystkich produktów ze zmianami.
-
-    # Uproszczona wersja: pobierz wszystkie produkty ze zmianami i przefiltruj w Pythonie.
-    all_changes = get_product_changes_for_report(guild_id, hours_ago)
-
-    price_drops = []
-    for change in all_changes:
-        if change["new_price_str"] and change["old_price_str"]:
-            try:
-                # Konwersja stringów cen na float. Zakłada, że ceny są w formacie "1234.56"
-                # Należy dodać bardziej robustne parsowanie cen, jeśli formaty są różne.
-                new_price = float(change["new_price_str"].replace(',', '.')) # Upewnij się, że kropka jest separatorem dziesiętnym
-                old_price = float(change["old_price_str"].replace(',', '.'))
-
-                if new_price < old_price:
-                    drop_amount = old_price - new_price
-                    drop_percentage = (drop_amount / old_price) * 100 if old_price > 0 else 0
-                    price_drops.append({
-                        "product_url": change["product_url"],
-                        "product_name": change["product_name"],
-                        "old_price_str": change["old_price_str"],
-                        "new_price_str": change["new_price_str"],
-                        "drop_amount_str": f"{drop_amount:.2f}", # Sformatowane
-                        "drop_percentage": drop_percentage
-                    })
-            except ValueError: # Błąd konwersji ceny na float
-                print(f"Błąd konwersji ceny dla produktu {change['product_url']}: old='{change['old_price_str']}', new='{change['new_price_str']}'")
-                continue # Pomiń ten produkt
-
-    # Sortuj po procentowym spadku (lub kwotowym)
-    price_drops.sort(key=lambda x: x["drop_percentage"], reverse=True)
-
-    return price_drops[:limit]
-
-
-# --- Funkcje dla Monitorowania Produktów (Product Watchlist) ---
-
-def add_watched_product(user_id: int, url: str, shop_name: str, guild_id: int = None) -> int | None:
-    """Dodaje nowy produkt do śledzenia. Zwraca ID produktu lub None jeśli już istnieje."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    try:
-        cursor.execute("""
-        INSERT INTO watched_products (guild_id, user_id_who_added, product_url, shop_name, last_scanned_at)
-        VALUES (?, ?, ?, ?, ?)
-        """, (guild_id, user_id, url, shop_name.lower(), int(time.time())))
-        product_id = cursor.lastrowid
-        conn.commit()
-        return product_id
-    except sqlite3.IntegrityError: # product_url jest UNIQUE
-        conn.rollback()
-        # Można by tu pobrać ID istniejącego produktu, jeśli to potrzebne
-        cursor.execute("SELECT id FROM watched_products WHERE product_url = ?", (url,))
-        existing = cursor.fetchone()
-        if existing: return existing[0] # Zwróć ID istniejącego, jeśli go znaleziono
-        return None
-    finally:
-        conn.close()
-
-def get_watched_product_by_url(url: str) -> dict | None:
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("""
-    SELECT id, guild_id, user_id_who_added, shop_name, product_name,
-           last_known_price_str, last_known_availability_str, last_scanned_at, is_active
-    FROM watched_products WHERE product_url = ?
-    """, (url,))
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        return {
-            "id": row[0], "guild_id": row[1], "user_id_who_added": row[2], "shop_name": row[3],
-            "product_name": row[4], "last_known_price_str": row[5],
-            "last_known_availability_str": row[6], "last_scanned_at": row[7], "is_active": bool(row[8])
-        }
-    return None
-
-def get_all_active_watched_products() -> list[dict]:
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("""
-    SELECT id, guild_id, user_id_who_added, product_url, shop_name, product_name,
-           last_known_price_str, last_known_availability_str, last_scanned_at
-    FROM watched_products
-    WHERE is_active = TRUE
-    """)
-    products = [
-        {
-            "id": row[0], "guild_id": row[1], "user_id_who_added": row[2], "product_url": row[3],
-            "shop_name": row[4], "product_name": row[5], "last_known_price_str": row[6],
-            "last_known_availability_str": row[7], "last_scanned_at": row[8]
-        } for row in cursor.fetchall()
-    ]
-    conn.close()
-    return products
-
-def update_watched_product_data(product_id: int, name: str | None, price_str: str | None,
-                                availability_str: str | None, scanned_at: int):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    updates = []
-    params = []
-    if name is not None: updates.append("product_name = ?"); params.append(name)
-    if price_str is not None: updates.append("last_known_price_str = ?"); params.append(price_str)
-    if availability_str is not None: updates.append("last_known_availability_str = ?"); params.append(availability_str)
-    updates.append("last_scanned_at = ?"); params.append(scanned_at)
-
-    if updates: # Powinno zawsze być, bo scanned_at jest wymagane
-        sql = f"UPDATE watched_products SET {', '.join(updates)} WHERE id = ?"
-        params.append(product_id)
-        cursor.execute(sql, tuple(params))
-        conn.commit()
-    conn.close()
-
-def add_price_history_entry(watched_product_id: int, scan_date: int, price_str: str | None, availability_str: str | None):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("""
-    INSERT INTO price_history (watched_product_id, scan_date, price_str, availability_str)
-    VALUES (?, ?, ?, ?)
-    """, (watched_product_id, scan_date, price_str, availability_str))
-    conn.commit()
-    conn.close()
-
-def get_product_price_history(watched_product_id: int, limit: int = 10) -> list[dict]:
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("""
-    SELECT scan_date, price_str, availability_str
-    FROM price_history
-    WHERE watched_product_id = ?
-    ORDER BY scan_date DESC
-    LIMIT ?
-    """, (watched_product_id, limit))
-    history = [
-        {"scan_date": row[0], "price_str": row[1], "availability_str": row[2]}
-        for row in cursor.fetchall()
-    ]
-    conn.close()
-    return history
-
-def deactivate_watched_product(product_id: int) -> bool:
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE watched_products SET is_active = FALSE WHERE id = ?", (product_id,))
-    updated_rows = cursor.rowcount
-    conn.commit()
-    conn.close()
-    return updated_rows > 0
-
-def get_user_watched_products(user_id: int, guild_id: int | None = None) -> list[dict]:
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    sql = """
-    SELECT id, product_url, shop_name, product_name, last_known_price_str, last_known_availability_str
-    FROM watched_products
-    WHERE user_id_who_added = ? AND is_active = TRUE
-    """
-    params = [user_id]
-    if guild_id is not None: # Jeśli chcemy filtrować po serwerze
-        sql += " AND guild_id = ?"
-        params.append(guild_id)
-
-    cursor.execute(sql, tuple(params))
-    products = [
-        {
-            "id": row[0], "product_url": row[1], "shop_name": row[2], "product_name": row[3],
-            "last_known_price_str": row[4], "last_known_availability_str": row[5]
-        } for row in cursor.fetchall()
-    ]
-    conn.close()
-    return products
+    try: rank = ranked_users.index(user_id) + 1; conn.close(); return rank, total_ranked_players
+    except ValueError: conn.close(); return None
 
 # --- Funkcje dla Ankiet (Polls) ---
 def create_poll(guild_id: int, channel_id: int, question: str, created_by_id: int, ends_at: int | None = None) -> int:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     created_at_ts = int(time.time())
-    cursor.execute("""
-    INSERT INTO polls (guild_id, channel_id, question, created_by_id, created_at, ends_at, is_active)
-    VALUES (?, ?, ?, ?, ?, ?, TRUE)
-    """, (guild_id, channel_id, question, created_by_id, created_at_ts, ends_at))
+    cursor.execute("INSERT INTO polls (guild_id, channel_id, question, created_by_id, created_at, ends_at, is_active) VALUES (?, ?, ?, ?, ?, ?, TRUE)", (guild_id, channel_id, question, created_by_id, created_at_ts, ends_at))
     poll_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -1015,10 +673,7 @@ def create_poll(guild_id: int, channel_id: int, question: str, created_by_id: in
 def add_poll_option(poll_id: int, option_text: str, reaction_emoji: str):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    INSERT INTO poll_options (poll_id, option_text, reaction_emoji)
-    VALUES (?, ?, ?)
-    """, (poll_id, option_text, reaction_emoji))
+    cursor.execute("INSERT INTO poll_options (poll_id, option_text, reaction_emoji) VALUES (?, ?, ?)", (poll_id, option_text, reaction_emoji))
     conn.commit()
     conn.close()
 
@@ -1035,36 +690,22 @@ def get_poll_by_message_id(message_id: int) -> dict | None:
     cursor.execute("SELECT id, guild_id, channel_id, question, created_by_id, created_at, ends_at, is_active, results_message_id FROM polls WHERE message_id = ?", (message_id,))
     row = cursor.fetchone()
     conn.close()
-    if row:
-        return {
-            "id": row[0], "guild_id": row[1], "channel_id": row[2], "question": row[3],
-            "created_by_id": row[4], "created_at": row[5], "ends_at": row[6],
-            "is_active": bool(row[7]), "results_message_id": row[8]
-        }
+    if row: return {"id": row[0], "guild_id": row[1], "channel_id": row[2], "question": row[3], "created_by_id": row[4], "created_at": row[5], "ends_at": row[6], "is_active": bool(row[7]), "results_message_id": row[8]}
     return None
 
 def get_active_polls_to_close(current_timestamp: int) -> list[dict]:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    SELECT id, guild_id, channel_id, message_id, question, created_by_id
-    FROM polls
-    WHERE is_active = TRUE AND ends_at IS NOT NULL AND ends_at <= ?
-    """, (current_timestamp,))
-    polls_to_close = [
-        {"id": row[0], "guild_id": row[1], "channel_id": row[2], "message_id": row[3], "question": row[4], "created_by_id": row[5]}
-        for row in cursor.fetchall()
-    ]
+    cursor.execute("SELECT id, guild_id, channel_id, message_id, question, created_by_id FROM polls WHERE is_active = TRUE AND ends_at IS NOT NULL AND ends_at <= ?", (current_timestamp,))
+    polls_to_close = [{"id": row[0], "guild_id": row[1], "channel_id": row[2], "message_id": row[3], "question": row[4], "created_by_id": row[5]} for row in cursor.fetchall()]
     conn.close()
     return polls_to_close
 
 def close_poll(poll_id: int, results_message_id: int | None = None):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    if results_message_id:
-        cursor.execute("UPDATE polls SET is_active = FALSE, results_message_id = ? WHERE id = ?", (results_message_id, poll_id))
-    else:
-        cursor.execute("UPDATE polls SET is_active = FALSE WHERE id = ?", (poll_id,))
+    if results_message_id: cursor.execute("UPDATE polls SET is_active = FALSE, results_message_id = ? WHERE id = ?", (results_message_id, poll_id))
+    else: cursor.execute("UPDATE polls SET is_active = FALSE WHERE id = ?", (poll_id,))
     conn.commit()
     conn.close()
 
@@ -1077,22 +718,14 @@ def get_poll_options(poll_id: int) -> list[dict]:
     return options
 
 def get_poll_details(poll_id: int) -> dict | None:
-    """Pobiera szczegóły ankiety wraz z jej opcjami."""
     poll_data = {}
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("SELECT id, guild_id, channel_id, message_id, question, created_by_id, created_at, ends_at, is_active, results_message_id FROM polls WHERE id = ?", (poll_id,))
     row = cursor.fetchone()
-    if not row:
-        conn.close()
-        return None
-
-    poll_data = {
-        "id": row[0], "guild_id": row[1], "channel_id": row[2], "message_id": row[3],
-        "question": row[4], "created_by_id": row[5], "created_at": row[6], "ends_at": row[7],
-        "is_active": bool(row[8]), "results_message_id": row[9]
-    }
-    poll_data["options"] = get_poll_options(poll_id) # Pobierz opcje dla tej ankiety
+    if not row: conn.close(); return None
+    poll_data = {"id": row[0], "guild_id": row[1], "channel_id": row[2], "message_id": row[3], "question": row[4], "created_by_id": row[5], "created_at": row[6], "ends_at": row[7], "is_active": bool(row[8]), "results_message_id": row[9]}
+    poll_data["options"] = get_poll_options(poll_id)
     conn.close()
     return poll_data
 
@@ -1102,28 +735,18 @@ def add_custom_command(guild_id: int, name: str, response_type: str, content: st
     cursor = conn.cursor()
     created_at_ts = int(time.time())
     try:
-        cursor.execute("""
-        INSERT INTO custom_commands (guild_id, command_name, response_type, response_content, created_by_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """, (guild_id, name.lower(), response_type, content, creator_id, created_at_ts))
+        cursor.execute("INSERT INTO custom_commands (guild_id, command_name, response_type, response_content, created_by_id, created_at) VALUES (?, ?, ?, ?, ?, ?)", (guild_id, name.lower(), response_type, content, creator_id, created_at_ts))
         command_id = cursor.lastrowid
         conn.commit()
         return command_id
-    except sqlite3.IntegrityError: # Nazwa komendy już istnieje
-        conn.rollback()
-        return None
-    finally:
-        conn.close()
+    except sqlite3.IntegrityError: conn.rollback(); return None
+    finally: conn.close()
 
 def edit_custom_command(guild_id: int, name: str, new_response_type: str, new_content: str, editor_id: int) -> bool:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     last_edited_at_ts = int(time.time())
-    cursor.execute("""
-    UPDATE custom_commands
-    SET response_type = ?, response_content = ?, last_edited_by_id = ?, last_edited_at = ?
-    WHERE guild_id = ? AND command_name = ?
-    """, (new_response_type, new_content, editor_id, last_edited_at_ts, guild_id, name.lower()))
+    cursor.execute("UPDATE custom_commands SET response_type = ?, response_content = ?, last_edited_by_id = ?, last_edited_at = ? WHERE guild_id = ? AND command_name = ?", (new_response_type, new_content, editor_id, last_edited_at_ts, guild_id, name.lower()))
     updated_rows = cursor.rowcount
     conn.commit()
     conn.close()
@@ -1141,50 +764,26 @@ def remove_custom_command(guild_id: int, name: str) -> bool:
 def get_custom_command(guild_id: int, name: str) -> dict | None:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    SELECT id, response_type, response_content, created_by_id, created_at, last_edited_by_id, last_edited_at
-    FROM custom_commands
-    WHERE guild_id = ? AND command_name = ?
-    """, (guild_id, name.lower()))
+    cursor.execute("SELECT id, response_type, response_content, created_by_id, created_at, last_edited_by_id, last_edited_at FROM custom_commands WHERE guild_id = ? AND command_name = ?", (guild_id, name.lower()))
     row = cursor.fetchone()
     conn.close()
-    if row:
-        return {
-            "id": row[0], "response_type": row[1], "response_content": row[2],
-            "created_by_id": row[3], "created_at": row[4],
-            "last_edited_by_id": row[5], "last_edited_at": row[6]
-        }
+    if row: return {"id": row[0], "response_type": row[1], "response_content": row[2], "created_by_id": row[3], "created_at": row[4], "last_edited_by_id": row[5], "last_edited_at": row[6]}
     return None
 
 def get_all_custom_commands(guild_id: int) -> list[dict]:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    SELECT id, command_name, response_type
-    FROM custom_commands
-    WHERE guild_id = ?
-    ORDER BY command_name ASC
-    """, (guild_id,))
+    cursor.execute("SELECT id, command_name, response_type FROM custom_commands WHERE guild_id = ? ORDER BY command_name ASC", (guild_id,))
     commands_list = [{"id": row[0], "command_name": row[1], "response_type": row[2]} for row in cursor.fetchall()]
     conn.close()
     return commands_list
 
-
 # --- Funkcje dla Konkursów (Giveaways) ---
-# import json # Już zaimportowany na górze
-
-def create_giveaway(guild_id: int, channel_id: int, prize: str, winner_count: int,
-                    created_by_id: int, ends_at: int,
-                    required_role_id: int | None = None, min_level: int | None = None) -> int:
+def create_giveaway(guild_id: int, channel_id: int, prize: str, winner_count: int, created_by_id: int, ends_at: int, required_role_id: int | None = None, min_level: int | None = None) -> int:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     created_at_ts = int(time.time())
-    cursor.execute("""
-    INSERT INTO giveaways (guild_id, channel_id, prize, winner_count, created_by_id, created_at, ends_at,
-                           required_role_id, min_level, is_active, winners_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, NULL)
-    """, (guild_id, channel_id, prize, winner_count, created_by_id, created_at_ts, ends_at,
-          required_role_id, min_level))
+    cursor.execute("INSERT INTO giveaways (guild_id, channel_id, prize, winner_count, created_by_id, created_at, ends_at, required_role_id, min_level, is_active, winners_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, NULL)", (guild_id, channel_id, prize, winner_count, created_by_id, created_at_ts, ends_at, required_role_id, min_level))
     giveaway_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -1195,10 +794,7 @@ def create_ticket(guild_id: int, user_id: int, topic: str | None) -> int:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     created_at_ts = int(time.time())
-    cursor.execute("""
-    INSERT INTO tickets (guild_id, user_id, topic, created_at, is_open)
-    VALUES (?, ?, ?, ?, TRUE)
-    """, (guild_id, user_id, topic, created_at_ts))
+    cursor.execute("INSERT INTO tickets (guild_id, user_id, topic, created_at, is_open) VALUES (?, ?, ?, ?, TRUE)", (guild_id, user_id, topic, created_at_ts))
     ticket_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -1214,46 +810,28 @@ def set_ticket_channel_id(ticket_id: int, channel_id: int):
 def get_open_ticket_by_user(guild_id: int, user_id: int) -> dict | None:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    SELECT id, channel_id, topic, created_at
-    FROM tickets
-    WHERE guild_id = ? AND user_id = ? AND is_open = TRUE
-    """, (guild_id, user_id))
+    cursor.execute("SELECT id, channel_id, topic, created_at FROM tickets WHERE guild_id = ? AND user_id = ? AND is_open = TRUE", (guild_id, user_id))
     row = cursor.fetchone()
     conn.close()
-    if row:
-        return {"id": row[0], "channel_id": row[1], "topic": row[2], "created_at": row[3]}
+    if row: return {"id": row[0], "channel_id": row[1], "topic": row[2], "created_at": row[3]}
     return None
 
 def get_ticket_by_channel(guild_id: int, channel_id: int) -> dict | None:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    SELECT id, user_id, topic, created_at, is_open, closed_by_id, closed_at
-    FROM tickets
-    WHERE guild_id = ? AND channel_id = ?
-    """, (guild_id, channel_id))
+    cursor.execute("SELECT id, user_id, topic, created_at, is_open, closed_by_id, closed_at FROM tickets WHERE guild_id = ? AND channel_id = ?", (guild_id, channel_id))
     row = cursor.fetchone()
     conn.close()
-    if row:
-        return {
-            "id": row[0], "user_id": row[1], "topic": row[2], "created_at": row[3],
-            "is_open": bool(row[4]), "closed_by_id": row[5], "closed_at": row[6]
-        }
+    if row: return {"id": row[0], "user_id": row[1], "topic": row[2], "created_at": row[3], "is_open": bool(row[4]), "closed_by_id": row[5], "closed_at": row[6]}
     return None
 
 def close_ticket(ticket_id: int, closed_by_id: int):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     closed_at_ts = int(time.time())
-    cursor.execute("""
-    UPDATE tickets
-    SET is_open = FALSE, closed_by_id = ?, closed_at = ?
-    WHERE id = ?
-    """, (closed_by_id, closed_at_ts, ticket_id))
+    cursor.execute("UPDATE tickets SET is_open = FALSE, closed_by_id = ?, closed_at = ? WHERE id = ?", (closed_by_id, closed_at_ts, ticket_id))
     conn.commit()
     conn.close()
-
 
 def set_giveaway_message_id(giveaway_id: int, message_id: int):
     conn = sqlite3.connect(DB_NAME)
@@ -1265,19 +843,8 @@ def set_giveaway_message_id(giveaway_id: int, message_id: int):
 def get_active_giveaways_to_end(current_timestamp: int) -> list[dict]:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-    SELECT id, guild_id, channel_id, message_id, prize, winner_count, created_by_id, ends_at,
-           required_role_id, min_level
-    FROM giveaways
-    WHERE is_active = TRUE AND ends_at <= ?
-    """, (current_timestamp,))
-    giveaways = [
-        {
-            "id": row[0], "guild_id": row[1], "channel_id": row[2], "message_id": row[3],
-            "prize": row[4], "winner_count": row[5], "created_by_id": row[6], "ends_at": row[7],
-            "required_role_id": row[8], "min_level": row[9]
-        } for row in cursor.fetchall()
-    ]
+    cursor.execute("SELECT id, guild_id, channel_id, message_id, prize, winner_count, created_by_id, ends_at, required_role_id, min_level FROM giveaways WHERE is_active = TRUE AND ends_at <= ?", (current_timestamp,))
+    giveaways = [{"id": r[0], "guild_id": r[1], "channel_id": r[2], "message_id": r[3], "prize": r[4], "winner_count": r[5], "created_by_id": r[6], "ends_at": r[7], "required_role_id": r[8], "min_level": r[9]} for r in cursor.fetchall()]
     conn.close()
     return giveaways
 
@@ -1289,24 +856,11 @@ def end_giveaway(giveaway_id: int, winners_ids: list[int]):
     conn.commit()
     conn.close()
 
-def get_giveaway_details(message_id: int) -> dict | None: # Może być też po giveaway_id
+def get_giveaway_details(message_id: int) -> dict | None:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # Zakładamy, że message_id jest unikalne dla aktywnych/ostatnich konkursów,
-    # ale jeśli chcemy historię, lepiej po giveaway_id. Na razie po message_id.
-    cursor.execute("""
-    SELECT id, guild_id, channel_id, prize, winner_count, created_by_id, created_at, ends_at,
-           is_active, required_role_id, min_level, winners_json
-    FROM giveaways
-    WHERE message_id = ?
-    """, (message_id,)) # Można dodać ORDER BY created_at DESC LIMIT 1 jeśli message_id nie jest UNIQUE globalnie
+    cursor.execute("SELECT id, guild_id, channel_id, prize, winner_count, created_by_id, created_at, ends_at, is_active, required_role_id, min_level, winners_json FROM giveaways WHERE message_id = ? ", (message_id,))
     row = cursor.fetchone()
     conn.close()
-    if row:
-        return {
-            "id": row[0], "guild_id": row[1], "channel_id": row[2], "prize": row[3],
-            "winner_count": row[4], "created_by_id": row[5], "created_at": row[6], "ends_at": row[7],
-            "is_active": bool(row[8]), "required_role_id": row[9], "min_level": row[10],
-            "winners_json": json.loads(row[11]) if row[11] else [] # Zwróć pustą listę jeśli NULL
-        }
+    if row: return {"id": row[0], "guild_id": row[1], "channel_id": row[2], "prize": row[3], "winner_count": row[4], "created_by_id": row[5], "created_at": row[6], "ends_at": row[7], "is_active": bool(row[8]), "required_role_id": row[9], "min_level": row[10], "winners_json": json.loads(row[11]) if row[11] else [] }
     return None
