@@ -58,20 +58,40 @@ def init_db():
         UNIQUE (guild_id, word)
     )
     """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS punishments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        moderator_id INTEGER NOT NULL,
+        type TEXT NOT NULL CHECK(type IN ('mute', 'ban', 'kick', 'warn')),
+        reason TEXT,
+        expires_at INTEGER,
+        active BOOLEAN DEFAULT TRUE,
+        created_at INTEGER NOT NULL
+    )
+    """)
+    # Indeksy dla częstych zapytań
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_punishments_user_guild ON punishments (user_id, guild_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_punishments_expires_active ON punishments (expires_at, active)")
     conn.commit()
     conn.close()
 
 if __name__ == '__main__':
     init_db()
-    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs', 'quiz_questions' i 'banned_words'.")
+    print(f"Baza danych '{DB_NAME}' zainicjalizowana z tabelami 'server_configs', 'timed_roles', 'user_activity', 'activity_role_configs', 'quiz_questions', 'banned_words' i 'punishments'.")
 
 def update_server_config(guild_id: int, welcome_message_content: str = None,
                          reaction_role_id: int = None, reaction_message_id: int = None,
                          unverified_role_id: int = None, verified_role_id: int = None,
-                         moderation_log_channel_id: int = None,
+                         moderation_log_channel_id: int = None, # Dla logów z auto-moderacji
                          filter_profanity_enabled: bool = None,
                          filter_spam_enabled: bool = None,
-                         filter_invites_enabled: bool = None):
+                         filter_invites_enabled: bool = None,
+                         muted_role_id: int = None,
+                         moderator_actions_log_channel_id: int = None
+                         ):
+    import time # Potrzebny dla created_at w punishments, ale też ogólnie może być przydatny
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     # Ensure the server_configs row exists
@@ -107,6 +127,12 @@ def update_server_config(guild_id: int, welcome_message_content: str = None,
     if filter_invites_enabled is not None:
         updates.append("filter_invites_enabled = ?")
         params.append(filter_invites_enabled)
+    if muted_role_id is not None:
+        updates.append("muted_role_id = ?")
+        params.append(muted_role_id)
+    if moderator_actions_log_channel_id is not None:
+        updates.append("moderator_actions_log_channel_id = ?")
+        params.append(moderator_actions_log_channel_id)
 
     if updates:
         sql = f"UPDATE server_configs SET {', '.join(updates)} WHERE guild_id = ?"
@@ -123,32 +149,93 @@ def get_server_config(guild_id: int):
         SELECT welcome_message_content, reaction_role_id, reaction_message_id,
                unverified_role_id, verified_role_id,
                moderation_log_channel_id, filter_profanity_enabled,
-               filter_spam_enabled, filter_invites_enabled
+               filter_spam_enabled, filter_invites_enabled,
+               muted_role_id, moderator_actions_log_channel_id
         FROM server_configs
         WHERE guild_id = ?
         """, (guild_id,))
     row = cursor.fetchone()
     conn.close()
     if row:
+        # Konwersja wartości bool z bazy (0/1) i obsługa None dla nowo dodanych kolumn
+        def get_bool(val, default=True):
+            if val is None: return default
+            return bool(val)
+
         return {
             "welcome_message_content": row[0],
             "reaction_role_id": row[1],
             "reaction_message_id": row[2],
             "unverified_role_id": row[3],
             "verified_role_id": row[4],
-            "moderation_log_channel_id": row[5],
-            # SQLite przechowuje BOOLEAN jako INTEGER 0 lub 1
-            "filter_profanity_enabled": bool(row[6]) if row[6] is not None else True, # Domyślnie True
-            "filter_spam_enabled": bool(row[7]) if row[7] is not None else True,       # Domyślnie True
-            "filter_invites_enabled": bool(row[8]) if row[8] is not None else True   # Domyślnie True
+            "moderation_log_channel_id": row[5], # Dla auto-moderacji
+            "filter_profanity_enabled": get_bool(row[6]),
+            "filter_spam_enabled": get_bool(row[7]),
+            "filter_invites_enabled": get_bool(row[8]),
+            "muted_role_id": row[9], # Dla systemu kar
+            "moderator_actions_log_channel_id": row[10] # Dla logów akcji moderatorów
         }
-    # Zwróć domyślną konfigurację, jeśli wiersz nie istnieje, ale upewnij się, że guild_id jest tam
-    # Lepiej jest, gdy `update_server_config` tworzy wiersz, a ta funkcja zwraca None, jeśli go nie ma
-    # lub podstawowe wartości domyślne, jeśli jest, ale niektóre pola są None.
-    # Dla spójności, jeśli INSERT OR IGNORE w update_server_config tworzy wiersz, to pola będą NULL.
-    # Tutaj nadajemy im wartości domyślne, jeśli są NULL w bazie.
-    # Jeśli serwer nie ma w ogóle wpisu, zwracamy None.
     return None
+
+
+# --- Funkcje dla Systemu Kar (Punishments) ---
+
+def add_punishment(guild_id: int, user_id: int, moderator_id: int,
+                   punishment_type: str, reason: str | None, expires_at: int | None = None) -> int:
+    import time
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    created_at = int(time.time())
+    cursor.execute("""
+    INSERT INTO punishments (guild_id, user_id, moderator_id, type, reason, expires_at, active, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (guild_id, user_id, moderator_id, punishment_type, reason, expires_at, True, created_at))
+    punishment_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return punishment_id
+
+def deactivate_punishment(punishment_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE punishments SET active = FALSE WHERE id = ?", (punishment_id,))
+    conn.commit()
+    conn.close()
+
+def get_active_user_punishment(guild_id: int, user_id: int, punishment_type: str) -> dict | None:
+    """Sprawdza, czy użytkownik ma aktywną karę danego typu."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT id, moderator_id, reason, expires_at, created_at
+    FROM punishments
+    WHERE guild_id = ? AND user_id = ? AND type = ? AND active = TRUE
+    ORDER BY created_at DESC LIMIT 1
+    """, (guild_id, user_id, punishment_type)) # Weź najnowszą aktywną karę
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {"id": row[0], "moderator_id": row[1], "reason": row[2], "expires_at": row[3], "created_at": row[4]}
+    return None
+
+def get_expired_active_punishments(current_timestamp: int) -> list[dict]:
+    """Pobiera aktywne kary (mute, ban), które już wygasły."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT id, guild_id, user_id, role_id, type, expires_at -- 'role_id' tu nie pasuje, to ogólna tabela kar
+    FROM punishments                                        -- usunę 'role_id' z selecta
+    WHERE active = TRUE AND expires_at IS NOT NULL AND expires_at <= ? AND type IN ('mute', 'ban')
+    """, (current_timestamp,))
+    # Poprawiony SELECT:
+    cursor.execute("""
+    SELECT id, guild_id, user_id, type, expires_at
+    FROM punishments
+    WHERE active = TRUE AND expires_at IS NOT NULL AND expires_at <= ? AND type IN ('mute', 'ban')
+    """, (current_timestamp,))
+    expired = [{"id": row[0], "guild_id": row[1], "user_id": row[2], "type": row[3], "expires_at": row[4]} for row in cursor.fetchall()]
+    conn.close()
+    return expired
 
 
 # --- Funkcje dla Czarnej Listy Słów (Moderacja) ---
